@@ -1,0 +1,24 @@
+{
+  "DEFAULT_COM_PORT": "COM6",
+  "DEFAULT_BAUDRATE": 9600,
+  "DEFAULT_PARITY": "NONE",
+  "DEFAULT_FLOW_CONTROL": "NONE",
+  "INTERLOCK_PORT": "COM5",
+  "INTERLOCK_BAUDRATE": 9600,
+  "INTERLOCK_ENABLED": true,
+  "LOG_DIR": "\\\\IFS\\hipot_logs\\Amidala",
+  "AUTO_SAVE_RESULTS": true,
+  "TEST_TIMEOUT": 300,
+  "TEST_PROFILE": {
+    "type": "ACW",
+    "voltage": 4000,
+    "limit_high": 2.5,
+    "limit_low": 0.05,
+    "ramp_time": 5.0,
+    "dwell": 1.0,
+    "ramp_dn": 0.0,
+    "arc_sense": 0,
+    "frequency": 60,
+    "continuity": "OFF"
+  }
+}
