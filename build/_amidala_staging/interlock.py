@@ -13,10 +13,14 @@ from typing import Callable, Optional
 
 import serial
 
+from safety_rules import validate_interlock_settings
+
 
 class InterlockMonitor:
-    CLOSED_SIGNALS = {"CLOSED", "1", "TRUE", "CLOSE", "LOCK"}
-    OPEN_SIGNALS = {"OPEN", "0", "FALSE", "UNLOCK"}
+    # Firmware stanowiska wysyla wyłącznie te dwa komunikaty.
+    # Inne wartosci sa odrzucane zamiast zgadywania stanu klapy.
+    CLOSED_SIGNALS = {"CLOSED"}
+    OPEN_SIGNALS = {"OPEN"}
 
     def __init__(
         self,
@@ -24,8 +28,9 @@ class InterlockMonitor:
         baudrate: int = 9600,
         heartbeat_timeout: float = 2.0,
     ):
-        self.port = port
-        self.baudrate = baudrate
+        self.port, self.baudrate, _ = validate_interlock_settings(
+            port, baudrate, True
+        )
         self.heartbeat_timeout = max(0.5, float(heartbeat_timeout))
         self.serial: Optional[serial.Serial] = None
         self.connected = False
@@ -54,16 +59,29 @@ class InterlockMonitor:
             return True
         except Exception as exc:
             print(f"[INTERLOCK] Błąd połączenia: {exc}")
+            try:
+                if self.serial and self.serial.is_open:
+                    self.serial.close()
+            except Exception:
+                pass
             self.connected = False
             return False
 
     def disconnect(self):
         self._stop_flag.set()
+        self._on_change = None
         try:
             if self.serial and self.serial.is_open:
                 self.serial.close()
         finally:
             self.connected = False
+            thread = self._thread
+            if (
+                thread
+                and thread.is_alive()
+                and thread is not threading.current_thread()
+            ):
+                thread.join(timeout=0.5)
             print("[INTERLOCK] Rozłączono")
 
     def set_on_change(self, callback: Callable[[Optional[bool]], None]):
@@ -90,6 +108,11 @@ class InterlockMonitor:
         self._loss_reported = True
         self.connected = False
         self._last_state = None
+        try:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+        except Exception:
+            pass
         print(f"[INTERLOCK] Utrata komunikacji: {reason}")
         self._notify(None)
 

@@ -1,0 +1,120 @@
+
+========================================================================
+[RUNTIME] Start sesji: 2026-07-24T09:23:25+02:00
+[RUNTIME] PID: 70840
+[RUNTIME] Python: 3.13.3 | frozen=False
+[RUNTIME] Log: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\app_runtime_logs\amidala_20260724.log
+========================================================================
+[RUNTIME] Hi-Pot Amidala 1.0.5
+[RUNTIME] Diagnostyka sesji: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\app_runtime_logs\amidala_20260724.log
+Połączono z: Chroma,19052,190520013341,5.14
+[KEYLOCK] SYST:KLOC ON -> ERR='+0,"No error"', STATE='1'
+[CONFIG] Efektywny LOW / próg obecności: 0.500 mA
+    SAFEty:STEP1:AC:LEVel 4000
+    ERR: '+0,"No error"'
+    SAFEty:STEP1:AC:LIMit:HIGH 0.0025
+    ERR: '+0,"No error"'
+    SAFEty:STEP1:AC:LIMit:LOW 0.0005
+    ERR: '+0,"No error"'
+    SAFEty:STEP1:AC:TIME:TEST 1.0
+    ERR: '+0,"No error"'
+    SAFEty:STEP1:AC:TIME:RAMP 5.0
+    ERR: '+0,"No error"'
+    SAFEty:STEP1:AC:TIME:FALL 0.0
+    ERR: '+0,"No error"'
+[VERIFY] Profil ACW odczytany zwrotnie: 4000.0 V, LOW 0.500 mA, HIGH 2.500 mA, RAMP/TEST/FALL 5.00/1.00/0.00 s
+[INTERLOCK] Połączono: COM11 @ 9600
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #1
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '1'
+[WYNIK] cycle_elapsed= '6.471'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '4001.0'
+[WYNIK] measured_i   = '0.000104'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743757_20260724092406.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #2
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '2'
+[WYNIK] cycle_elapsed= '6.714'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.000104'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743656_20260724092431.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #3
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '3'
+[WYNIK] cycle_elapsed= '6.434'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.000104'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743657_20260724092445.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #4
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '4'
+[WYNIK] cycle_elapsed= '6.453'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.000104'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743651_20260724092458.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #5
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '5'
+[WYNIK] cycle_elapsed= '6.696'
+[WYNIK] judgment_code= '116'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.001729'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743652_20260724092522.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #6
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '6'
+[WYNIK] cycle_elapsed= '6.496'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.000106'
+[WYNIK] real_i       = '9.91e+37'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743653_20260724092542.txt
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[INTERLOCK] Zmiana stanu: 'CLOSED'
+[START] SYST:ERR? = '+0,"No error"', KLOC='1'
+[START] Potwierdzono nowy cykl #7
+[LOAD] Próg obecności: 0.500 mA | efektywny LOW: 0.500 mA
+[WYNIK] cycle_id     = '7'
+[WYNIK] cycle_elapsed= '6.452'
+[WYNIK] judgment_code= '18'
+[WYNIK] output_v     = '3999.0'
+[WYNIK] measured_i   = '0.00012'
+[WYNIK] real_i       = '9.91e+37'
+[INTERLOCK] Zmiana stanu: 'OPEN'
+[LOG] Sciezka podstawowa niedostepna: \\IFS\hipot_logs\Amidala ([WinError 53] Nie można odnaleźć ścieżki sieciowej: '\\\\IFS\\hipot_logs\\')
+[LOG] Zapis awaryjny: C:\Users\kacper.urbanowicz\PycharmProjects\hipot_amidala\logs_pending\21153628743654_20260724092602.txt
+[INTERLOCK] Rozłączono

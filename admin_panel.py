@@ -4,6 +4,12 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from settings_manager import SettingsManager
+from safety_rules import (
+    MIN_PRESENCE_CURRENT_MA,
+    validate_acw_profile,
+    validate_interlock_settings,
+    validate_rs232_settings,
+)
 
 
 class AdminPanel:
@@ -147,38 +153,87 @@ class AdminPanel:
         self.rs232_test_result.pack(pady=4)
 
     def _save_rs232(self):
-        self.config.DEFAULT_COM_PORT     = self.com_port_var.get().strip()
-        self.config.DEFAULT_BAUDRATE     = int(self.baudrate_var.get())
-        self.config.DEFAULT_PARITY       = self.parity_var.get()
-        self.config.DEFAULT_FLOW_CONTROL = self.flow_ctrl_var.get()
-        self.settings.save_config(self.config)
+        try:
+            port, baud, parity, flow = validate_rs232_settings(
+                self.com_port_var.get(),
+                self.baudrate_var.get(),
+                self.parity_var.get(),
+                self.flow_ctrl_var.get(),
+            )
+            previous = (
+                self.config.DEFAULT_COM_PORT,
+                self.config.DEFAULT_BAUDRATE,
+                self.config.DEFAULT_PARITY,
+                self.config.DEFAULT_FLOW_CONTROL,
+            )
+            self.config.DEFAULT_COM_PORT = port
+            self.config.DEFAULT_BAUDRATE = baud
+            self.config.DEFAULT_PARITY = parity
+            self.config.DEFAULT_FLOW_CONTROL = flow
+            self.settings.save_config(self.config)
+        except Exception as exc:
+            if "previous" in locals():
+                (
+                    self.config.DEFAULT_COM_PORT,
+                    self.config.DEFAULT_BAUDRATE,
+                    self.config.DEFAULT_PARITY,
+                    self.config.DEFAULT_FLOW_CONTROL,
+                ) = previous
+            self.rs232_status.config(
+                text=f"✗ Nie zapisano: {exc}", fg=self.config.COLOR_ERROR
+            )
+            return
         self.rs232_status.config(
             text="✓ Zapisano — zmiany aktywne od następnego połączenia",
             fg=self.config.COLOR_ACCENT)
 
     def _test_rs232(self):
         import threading
+        try:
+            port, baud, parity, flow = validate_rs232_settings(
+                self.com_port_var.get(),
+                self.baudrate_var.get(),
+                self.parity_var.get(),
+                self.flow_ctrl_var.get(),
+            )
+        except Exception as exc:
+            self.rs232_test_result.config(
+                text=f"✗ Błąd ustawień: {exc}", fg=self.config.COLOR_ERROR
+            )
+            return
+
         self.rs232_test_result.config(text="⏳ Łączenie...", fg="#FF9800")
 
         def do_test():
             try:
                 from hipot_device import ChromaHiPotDevice
-                port = self.com_port_var.get().strip()
-                baud = int(self.baudrate_var.get())
-                dev  = ChromaHiPotDevice(port=port, baudrate=baud)
-                ok   = dev.connect()
+                dev = ChromaHiPotDevice(
+                    port=port,
+                    baudrate=baud,
+                    parity=parity,
+                    flow_control=flow,
+                )
+                ok = dev.connect()
                 if ok:
                     dev.disconnect()
-                    self.window.after(0, lambda: self.rs232_test_result.config(
-                        text=f"✓ Połączono z Hi-Pot na {port}",
-                        fg=self.config.COLOR_ACCENT))
+                    text = f"✓ Połączono z Hi-Pot na {port}"
+                    fg = self.config.COLOR_ACCENT
                 else:
-                    self.window.after(0, lambda: self.rs232_test_result.config(
-                        text=f"✗ Brak odpowiedzi na {port}",
-                        fg=self.config.COLOR_ERROR))
-            except Exception as e:
-                self.window.after(0, lambda: self.rs232_test_result.config(
-                    text=f"✗ Błąd: {e}", fg=self.config.COLOR_ERROR))
+                    text = f"✗ Brak odpowiedzi na {port}"
+                    fg = self.config.COLOR_ERROR
+            except Exception as exc:
+                text = f"✗ Błąd: {exc}"
+                fg = self.config.COLOR_ERROR
+
+            try:
+                self.window.after(
+                    0,
+                    lambda message=text, color=fg: self.rs232_test_result.config(
+                        text=message, fg=color
+                    ),
+                )
+            except (tk.TclError, RuntimeError):
+                pass
 
         threading.Thread(target=do_test, daemon=True).start()
 
@@ -238,10 +293,10 @@ class AdminPanel:
         tk.Checkbutton(inner, variable=self.interlock_enabled_var,
                        bg=self.config.COLOR_WHITE,
                        activebackground=self.config.COLOR_WHITE,
-                       cursor="hand2").grid(row=2, column=1, sticky="w", pady=7)
+                       state="disabled").grid(row=2, column=1, sticky="w", pady=7)
 
         tk.Label(inner,
-                 text="(odznacz aby używać przycisku START ręcznie)",
+                 text="(wymagany w wersji produkcyjnej — brak trybu ręcznego)",
                  bg=self.config.COLOR_WHITE, fg="#999999",
                  font=("Arial", 8, "italic")).grid(
                      row=3, column=0, columnspan=2, sticky="w", pady=(0, 5))
@@ -283,18 +338,51 @@ class AdminPanel:
         return f"Aktualnie: {port} @{baud} baud — {status}"
 
     def _save_interlock(self):
-        self.config.INTERLOCK_PORT     = self.interlock_port_var.get().strip()
-        self.config.INTERLOCK_BAUDRATE = int(self.interlock_baud_var.get())
-        self.config.INTERLOCK_ENABLED  = self.interlock_enabled_var.get()
-        self.settings.save_config(self.config)
+        # Wersja produkcyjna nie udostepnia obejscia sekwencji OPEN -> CLOSED.
+        self.interlock_enabled_var.set(True)
+        try:
+            port, baud, enabled = validate_interlock_settings(
+                self.interlock_port_var.get(),
+                self.interlock_baud_var.get(),
+                True,
+            )
+            previous = (
+                self.config.INTERLOCK_PORT,
+                self.config.INTERLOCK_BAUDRATE,
+                self.config.INTERLOCK_ENABLED,
+            )
+            self.config.INTERLOCK_PORT = port
+            self.config.INTERLOCK_BAUDRATE = baud
+            self.config.INTERLOCK_ENABLED = enabled
+            self.settings.save_config(self.config)
+        except Exception as exc:
+            if "previous" in locals():
+                (
+                    self.config.INTERLOCK_PORT,
+                    self.config.INTERLOCK_BAUDRATE,
+                    self.config.INTERLOCK_ENABLED,
+                ) = previous
+            self.interlock_status.config(
+                text=f"✗ Nie zapisano: {exc}", fg=self.config.COLOR_ERROR
+            )
+            return
         self.interlock_current_label.config(text=self._interlock_current_text())
         self.interlock_status.config(
             text="✓ Zapisano — zmiany aktywne po restarcie aplikacji",
             fg=self.config.COLOR_ACCENT)
 
     def _test_interlock(self):
-        port = self.interlock_port_var.get().strip()
-        baud = int(self.interlock_baud_var.get())
+        try:
+            port, baud, _ = validate_interlock_settings(
+                self.interlock_port_var.get(),
+                self.interlock_baud_var.get(),
+                True,
+            )
+        except Exception as exc:
+            self.interlock_test_result.config(
+                text=f"✗ Błąd ustawień: {exc}", fg=self.config.COLOR_ERROR
+            )
+            return
         self.interlock_test_result.config(
             text=f"⏳ Łączenie z Arduino na {port}...", fg="#FF9800")
         self.window.update()
@@ -325,11 +413,27 @@ class AdminPanel:
                 else:
                     msg = "⚠ Podłączone, brak danych — sprawdź baudrate/szkic"
                     fg  = "#FF9800"
-                self.window.after(0, lambda: self.interlock_test_result.config(
-                    text=msg, fg=fg))
-            except Exception as e:
-                self.window.after(0, lambda: self.interlock_test_result.config(
-                    text=f"✗ Błąd: {e}", fg=self.config.COLOR_ERROR))
+                try:
+                    self.window.after(
+                        0,
+                        lambda message=msg, color=fg: self.interlock_test_result.config(
+                            text=message, fg=color
+                        ),
+                    )
+                except (tk.TclError, RuntimeError):
+                    pass
+            except Exception as exc:
+                error_text = str(exc)
+                try:
+                    self.window.after(
+                        0,
+                        lambda message=error_text: self.interlock_test_result.config(
+                            text=f"✗ Błąd: {message}",
+                            fg=self.config.COLOR_ERROR,
+                        ),
+                    )
+                except (tk.TclError, RuntimeError):
+                    pass
 
         threading.Thread(target=do_test, daemon=True).start()
 
@@ -458,7 +562,15 @@ class AdminPanel:
                 "Potwierdź", f"Usunąć mapowanie '{hwid}'?",
                 parent=self.window):
             return
-        if HwidMap().remove_hwid(hwid):
+        try:
+            removed = HwidMap().remove_hwid(hwid)
+        except Exception as exc:
+            self.hwid_status.config(
+                text=f"✗ Nie udało się zapisać mapy: {exc}",
+                fg=self.config.COLOR_ERROR,
+            )
+            return
+        if removed:
             self._reload_hwid_tree()
             self.hwid_status.config(
                 text=f"✓ Usunięto: {hwid}", fg=self.config.COLOR_ACCENT)
@@ -495,6 +607,7 @@ class AdminPanel:
         self._pv_voltage    = tk.StringVar(value=str(p['voltage'] / 1000))
         self._pv_limit_high = tk.StringVar(value=str(p['limit_high']))
         self._pv_limit_low  = tk.StringVar(value=str(p['limit_low']))
+        self._pv_presence_min = tk.StringVar(value=str(p.get('presence_min_current', MIN_PRESENCE_CURRENT_MA)))
         self._pv_ramp       = tk.StringVar(value=str(p['ramp_time']))
         self._pv_dwell      = tk.StringVar(value=str(p['dwell']))
         self._pv_ramp_dn    = tk.StringVar(value=str(p['ramp_dn']))
@@ -524,24 +637,25 @@ class AdminPanel:
         row(1, "Voltage:",    self._pv_voltage,           "kV")
         row(2, "Max Limit:",  self._pv_limit_high,        "mA")
         row(3, "Min Limit:",  self._pv_limit_low,         "mA")
-        row(4, "Ramp Time:",  self._pv_ramp,              "s")
-        row(5, "Dwell:",      self._pv_dwell,             "s")
-        row(6, "Ramp Down:",  self._pv_ramp_dn,           "s")
-        row(7, "Arc Sense:",  self._pv_arc,               "ust. na Chroma", readonly=True)
-        row(8, "Frequency:",  self._pv_freq,              "Hz — ust. na Chroma", readonly=True)
-        row(9, "Continuity:", tk.StringVar(value="OFF"),  "", readonly=True)
+        row(4, "Min obecności:", self._pv_presence_min,      f"mA (minimum {MIN_PRESENCE_CURRENT_MA:.3f})")
+        row(5, "Ramp Time:",  self._pv_ramp,              "s")
+        row(6, "Dwell:",      self._pv_dwell,             "s")
+        row(7, "Ramp Down:",  self._pv_ramp_dn,           "s")
+        row(8, "Arc Sense:",  self._pv_arc,               "ust. na Chroma", readonly=True)
+        row(9, "Frequency:",  self._pv_freq,              "Hz — ust. na Chroma", readonly=True)
+        row(10, "Continuity:", tk.StringVar(value="OFF"),  "ust. na Chroma", readonly=True)
 
         tk.Label(
             inner,
-            text=("Arc Sense i Frequency nie są programowane przez aplikację, "
-                  "ponieważ firmware 5.14 odrzucał używane komendy. "
-                  "Wartości należy potwierdzić na panelu Chromy."),
+            text=("Arc Sense, Frequency i Continuity nie są programowane ani "
+                  "odczytywane zwrotnie przez aplikację. Wartości należy "
+                  "potwierdzić na panelu Chromy przed wydaniem stanowiska."),
             bg=self.config.COLOR_WHITE,
             fg="#E65100",
             font=("Arial", 8, "italic"),
             justify="left",
             wraplength=520,
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         self.profile_status = tk.Label(
             frame, text="", bg=self.config.COLOR_WHITE, font=("Arial", 10))
@@ -558,6 +672,7 @@ class AdminPanel:
             voltage    = float(self._pv_voltage.get())
             limit_high = float(self._pv_limit_high.get())
             limit_low  = float(self._pv_limit_low.get())
+            presence_min = float(self._pv_presence_min.get())
             ramp_time  = float(self._pv_ramp.get())
             dwell      = float(self._pv_dwell.get())
             ramp_dn    = float(self._pv_ramp_dn.get())
@@ -569,40 +684,57 @@ class AdminPanel:
                 fg=self.config.COLOR_ERROR)
             return
 
-        errors = []
-        if not (0.1 <= voltage <= 5.0):
-            errors.append("Voltage: 0.1–5.0 kV")
-        if not (0.0 < limit_high <= 10.0):
-            errors.append("Max Limit: 0.001–10.0 mA")
-        if not (0.0 <= limit_low < limit_high):
-            errors.append("Min Limit musi być < Max Limit")
-        if not (0.0 <= ramp_time <= 999.0):
-            errors.append("Ramp Time: 0–999 s")
-        if not (0.1 <= dwell <= 999.0):
-            errors.append("Dwell: 0.1–999 s")
-        if frequency not in (50, 60):
-            errors.append("Frequency: 50 lub 60 Hz")
-        if errors:
+        candidate = {
+            "type": "ACW",
+            "voltage": voltage * 1000.0,
+            "limit_high": limit_high,
+            "limit_low": limit_low,
+            "presence_min_current": presence_min,
+            "ramp_time": ramp_time,
+            "dwell": dwell,
+            "ramp_dn": ramp_dn,
+            "arc_sense": arc_sense,
+            "frequency": frequency,
+            "continuity": "OFF",
+        }
+        try:
+            normalized = validate_acw_profile(candidate)
+            effective_low = max(
+                normalized["limit_low"], normalized["presence_min_current"]
+            )
+            confirmed = messagebox.askyesno(
+                "Potwierdzenie profilu produkcyjnego",
+                "Ten profil zostanie użyty dla WSZYSTKICH modeli z mapy HWID.\n\n"
+                f"Napięcie: {normalized['voltage'] / 1000:.2f} kV\n"
+                f"Limit Chromy: {effective_low:.3f}–"
+                f"{normalized['limit_high']:.3f} mA\n"
+                f"Ramp/Dwell/Fall: {normalized['ramp_time']:.1f} / "
+                f"{normalized['dwell']:.1f} / {normalized['ramp_dn']:.1f} s\n\n"
+                "Czy wartości są zgodne z zatwierdzoną instrukcją testową?",
+                parent=self.window,
+            )
+            if not confirmed:
+                self.profile_status.config(
+                    text="Anulowano zapis profilu.", fg="#FF9800"
+                )
+                return
+            old_profile = dict(self.config.TEST_PROFILE)
+            self.config.TEST_PROFILE = normalized
+            self.settings.save_config(self.config)
+        except Exception as exc:
+            self.config.TEST_PROFILE = old_profile if "old_profile" in locals() else self.config.TEST_PROFILE
             self.profile_status.config(
-                text="✗ " + " | ".join(errors),
-                fg=self.config.COLOR_ERROR)
+                text=f"✗ Nie zapisano: {exc}", fg=self.config.COLOR_ERROR
+            )
             return
 
-        self.config.TEST_PROFILE['voltage']    = int(voltage * 1000)
-        self.config.TEST_PROFILE['limit_high'] = limit_high
-        self.config.TEST_PROFILE['limit_low']  = limit_low
-        self.config.TEST_PROFILE['ramp_time']  = ramp_time
-        self.config.TEST_PROFILE['dwell']      = dwell
-        self.config.TEST_PROFILE['ramp_dn']    = ramp_dn
-        self.config.TEST_PROFILE['arc_sense']  = arc_sense
-        self.config.TEST_PROFILE['frequency']  = frequency
 
-        self.settings.save_config(self.config)
-
-        total = ramp_time + dwell + ramp_dn
+        total = normalized["ramp_time"] + normalized["dwell"] + normalized["ramp_dn"]
         self.profile_status.config(
-            text=f"✓ Zapisano | {voltage:.2f} kV | "
-                 f"{limit_low:.3f}–{limit_high:.3f} mA | "
+            text=f"✓ Zapisano | {normalized['voltage'] / 1000:.2f} kV | "
+                 f"Limit Chromy {max(normalized['limit_low'], normalized['presence_min_current']):.3f}–"
+                 f"{normalized['limit_high']:.3f} mA | "
+                 f"obecność ≥ {normalized['presence_min_current']:.3f} mA | "
                  f"Czas całk.: {total:.1f} s",
             fg=self.config.COLOR_ACCENT)
 
@@ -735,8 +867,17 @@ class AdminPanel:
                 text=f"✗ Nie można utworzyć folderu: {e}",
                 fg=self.config.COLOR_ERROR)
             return
+        previous_path = self.config.LOG_DIR
         self.config.LOG_DIR = path
-        self.settings.save_config(self.config)
+        try:
+            self.settings.save_config(self.config)
+        except Exception as exc:
+            self.config.LOG_DIR = previous_path
+            self.log_status.config(
+                text=f"✗ Nie zapisano konfiguracji: {exc}",
+                fg=self.config.COLOR_ERROR,
+            )
+            return
         self.log_active_label.config(
             text=f"Aktualnie aktywna: {path}")
         self.log_status.config(

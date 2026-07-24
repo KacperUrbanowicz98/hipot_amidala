@@ -4,7 +4,7 @@
  False,
  True,
  'C:\\Users\\kacper.urbanowicz\\PycharmProjects\\hipot_amidala\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\images\\icon-windowed.ico',
- versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(1, 0, 0, 0), prodvers=(1, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('040904B0', [versioninfo.StringStruct('CompanyName', 'Reconext'), versioninfo.StringStruct('FileDescription', 'Reconext Hi-Pot Amidala Tester'), versioninfo.StringStruct('FileVersion', '1.0.0.0'), versioninfo.StringStruct('InternalName', 'Hi-Pot Amidala'), versioninfo.StringStruct('LegalCopyright', 'Reconext 2026'), versioninfo.StringStruct('OriginalFilename', 'Hi-Pot Amidala.exe'), versioninfo.StringStruct('ProductName', 'Reconext Hi-Pot Amidala'), versioninfo.StringStruct('ProductVersion', '1.0.0.0')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1033, 1200])])]),
+ versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(1, 0, 5, 0), prodvers=(1, 0, 5, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('040904B0', [versioninfo.StringStruct('CompanyName', 'Reconext'), versioninfo.StringStruct('FileDescription', 'Hi-Pot Amidala Tester'), versioninfo.StringStruct('FileVersion', '1.0.5.0'), versioninfo.StringStruct('InternalName', 'Hi-Pot Amidala'), versioninfo.StringStruct('LegalCopyright', 'Reconext 2026'), versioninfo.StringStruct('OriginalFilename', 'Hi-Pot Amidala.exe'), versioninfo.StringStruct('ProductName', 'Reconext Hi-Pot Amidala'), versioninfo.StringStruct('ProductVersion', '1.0.5.0')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1033, 1200])])]),
  False,
  False,
  b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<assembly xmlns='
@@ -75,7 +75,7 @@
  [],
  False,
  False,
- 1784121806,
+ 1784878019,
  [('runw.exe',
    'C:\\Users\\kacper.urbanowicz\\PycharmProjects\\hipot_amidala\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

@@ -1,0 +1,18 @@
+Chroma 19052 Test report
+
+Program:	ESD-160S/VE
+S/N:		21153628743656
+TIME:		2026/07/24 09:24:31
+Total result:	Fail
+
+STEP:		1
+MODE:		WVAC
+EXT Name:	
+Vtm:		3.999	KV
+Im:		0.104	mA
+Low:		0.500	mA
+High:		2.500	mA
+Result:		Fail
+Error Code:	18
+
+Error Description: AC Mode Low Fail

@@ -1,6 +1,7 @@
 # gui.py
 """Interfejs graficzny aplikacji Hi-Pot Amidala"""
 import tkinter as tk
+from tkinter import messagebox
 from config import Config
 from admin_panel import AdminPanel
 
@@ -10,6 +11,9 @@ class AmidalaApp:
     def __init__(self, root):
         self.root   = root
         self.config = Config()
+        self.current_test_screen = None
+        self._scan_pending = False
+        self._scan_after_id = None
         self._setup_window()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self._create_main_app()
@@ -20,6 +24,21 @@ class AmidalaApp:
         self.root.configure(bg=self.config.COLOR_BG)
 
     def _on_closing(self):
+        screen = self.current_test_screen
+        cycle_busy = bool(
+            screen is not None
+            and (screen.test_running or getattr(screen, "_result_pending", False))
+        )
+        if cycle_busy:
+            if not messagebox.askyesno(
+                "Cykl Hi-Pot w toku",
+                "Zamknięcie aplikacji zatrzyma aktywny test lub przerwie "
+                "finalizację wyniku. Zamknąć aplikację?",
+                parent=self.root,
+            ):
+                return
+        if screen is not None:
+            screen.shutdown()
         self.root.destroy()
 
     # ------------------------------------------------------------------ #
@@ -42,6 +61,8 @@ class AmidalaApp:
         self.root.bind("<Control-Alt-D>", self._on_config_shortcut)
 
     def _on_config_shortcut(self, event=None):
+        if self.current_test_screen is not None or self._scan_pending:
+            return
         self._d_press_count += 1
         if self._d_press_timer:
             self.root.after_cancel(self._d_press_timer)
@@ -112,6 +133,14 @@ class AmidalaApp:
                   command=pw_win.destroy).pack(side=tk.LEFT, padx=5)
 
     def _show_admin_panel(self):
+        if self.current_test_screen is not None or self._scan_pending:
+            messagebox.showwarning(
+                "Panel zablokowany",
+                "Ustawień nie można zmieniać na ekranie testowym. "
+                "Wróć do menu głównego.",
+                parent=self.root,
+            )
+            return
         AdminPanel(self.root, self.config).show()
 
     # ------------------------------------------------------------------ #
@@ -146,20 +175,22 @@ class AmidalaApp:
             bg=self.config.COLOR_WHITE, font=("Arial", 11))
         self.scan_status_label.pack(pady=5)
 
-        confirm_btn = tk.Button(
+        self.confirm_btn = tk.Button(
             scan_panel, text="POTWIERDŹ",
             bg=self.config.COLOR_ACCENT, fg=self.config.COLOR_WHITE,
             font=("Arial", 14, "bold"), width=20, height=2,
             relief=tk.FLAT, cursor="hand2",
             command=self._process_serial)
-        confirm_btn.pack(pady=(10, 30), padx=50)
-        confirm_btn.bind("<Enter>",
-                         lambda e: confirm_btn.config(bg="#66BB6A"))
-        confirm_btn.bind("<Leave>",
-                         lambda e: confirm_btn.config(
+        self.confirm_btn.pack(pady=(10, 30), padx=50)
+        self.confirm_btn.bind("<Enter>",
+                         lambda e: self.confirm_btn.config(bg="#66BB6A"))
+        self.confirm_btn.bind("<Leave>",
+                         lambda e: self.confirm_btn.config(
                              bg=self.config.COLOR_ACCENT))
 
     def _process_serial(self):
+        if self._scan_pending:
+            return
         from hwid_map import HwidMap
         serial = self.serial_entry.get().strip().upper()
 
@@ -183,23 +214,54 @@ class AmidalaApp:
             text=f"✓ Model: {model_name} | SN: {len(serial)} znaków — OK",
             fg=self.config.COLOR_ACCENT)
 
-        self.root.after(
-            800,
-            lambda: self._show_test_screen(serial, model_name))
+        self._scan_pending = True
+        self.serial_entry.config(state="disabled")
+        self.confirm_btn.config(state="disabled")
+        self._scan_after_id = self.root.after(
+            300, lambda: self._show_test_screen(serial, model_name)
+        )
 
     def _show_test_screen(self, serial, model_name):
-        from test_screen import TestScreen
-        TestScreen(
-            parent     = self.root,
-            config     = self.config,
-            serial     = serial,
-            model_name = model_name,
-            app_ref    = self).show()
+        self._scan_after_id = None
+        screen = None
+        try:
+            from test_screen import TestScreen
+            screen = TestScreen(
+                parent=self.root,
+                config=self.config,
+                serial=serial,
+                model_name=model_name,
+                app_ref=self,
+            )
+            self.current_test_screen = screen
+            screen.show()
+        except Exception as exc:
+            if screen is not None:
+                try:
+                    screen.shutdown()
+                except Exception:
+                    pass
+            self.current_test_screen = None
+            self._scan_pending = False
+            messagebox.showerror(
+                "Błąd otwierania ekranu testowego",
+                f"Ekran testowy nie został uruchomiony:\n{exc}",
+                parent=self.root,
+            )
+            self.show_scan_screen()
 
     # ------------------------------------------------------------------ #
     # POWRÓT DO SKANOWANIA                                                 #
     # ------------------------------------------------------------------ #
     def show_scan_screen(self):
+        self.current_test_screen = None
+        self._scan_pending = False
+        if self._scan_after_id:
+            try:
+                self.root.after_cancel(self._scan_after_id)
+            except Exception:
+                pass
+            self._scan_after_id = None
         for widget in self.root.winfo_children():
             widget.destroy()
         self._create_header()
@@ -229,7 +291,7 @@ class AmidalaApp:
                           bg=self.config.COLOR_PRIMARY, height=40)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
         footer.pack_propagate(False)
-        tk.Label(footer, text="Wersja 1.0.2 — bez kontroli duplikatów",
+        tk.Label(footer, text=f"Wersja {self.config.APP_VERSION} — audyt bezpieczeństwa",
                  bg=self.config.COLOR_PRIMARY, fg=self.config.COLOR_WHITE,
                  font=("Arial", 9, "bold")).pack(
                      side=tk.LEFT, padx=20, pady=10)

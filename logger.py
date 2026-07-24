@@ -1,16 +1,12 @@
 # logger.py
-"""Zapis raportów testów zgodnych z Chroma 19052.
-
-Gdy skonfigurowany udział sieciowy jest niedostępny, raport jest zachowany
-lokalnie w folderze ``logs_pending`` obok aplikacji, zamiast zostać utracony.
-"""
+"""Zapis raportow testow zgodnych z Chroma 19052."""
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from datetime import datetime
-
 
 _DEFAULT_LOG_DIR = "logs"
 _FALLBACK_DIR = "logs_pending"
@@ -45,7 +41,6 @@ def _application_dir() -> str:
 
 
 def get_fallback_log_dir() -> str:
-    """Zwraca lokalny folder awaryjny używany także do kontroli duplikatów."""
     return os.path.join(_application_dir(), _FALLBACK_DIR)
 
 
@@ -56,11 +51,12 @@ def _report_lines(
     im: float,
     result: str,
     error_code: str,
+    low_limit: float,
+    high_limit: float,
     now: datetime,
 ) -> list[str]:
     result_cap = "Pass" if str(result).upper() == "PASS" else "Fail"
     error_description = _get_error_description(error_code)
-
     return [
         "Chroma 19052 Test report",
         "",
@@ -74,8 +70,8 @@ def _report_lines(
         "EXT Name:\t",
         f"Vtm:\t\t{vtm:.3f}\tKV",
         f"Im:\t\t{im:.3f}\tmA",
-        "Low:\t\t0.050\tmA",
-        "High:\t\t2.500\tmA",
+        f"Low:\t\t{low_limit:.3f}\tmA",
+        f"High:\t\t{high_limit:.3f}\tmA",
         f"Result:\t\t{result_cap}",
         f"Error Code:\t{error_code}",
         "",
@@ -84,11 +80,25 @@ def _report_lines(
 
 
 def _write_report(directory: str, filename: str, lines: list[str]) -> str:
+    """Publikuje raport atomowo: watcher widzi dopiero kompletny plik TXT."""
     os.makedirs(directory, exist_ok=True)
     filepath = os.path.join(directory, filename)
-    with open(filepath, "w", encoding="utf-8", newline="") as file:
-        file.write("\r\n".join(lines))
-    return filepath
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{filename}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write("\r\n".join(lines))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, filepath)
+        return filepath
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def save_report(
@@ -99,13 +109,16 @@ def save_report(
     im: float,
     result: str,
     error_code: str = "",
+    low_limit: float = 0.050,
+    high_limit: float = 2.500,
     log_dir: str = _DEFAULT_LOG_DIR,
 ) -> str:
-    del operator  # zachowane w API dla zgodności z resztą aplikacji
-
+    del operator
     now = datetime.now()
     filename = f"{serial}_{now.strftime('%Y%m%d%H%M%S')}.txt"
-    lines = _report_lines(program, serial, vtm, im, result, error_code, now)
+    lines = _report_lines(
+        program, serial, vtm, im, result, error_code, low_limit, high_limit, now
+    )
 
     try:
         filepath = _write_report(log_dir, filename, lines)
@@ -115,7 +128,7 @@ def save_report(
         fallback_dir = get_fallback_log_dir()
         filepath = _write_report(fallback_dir, filename, lines)
         print(
-            f"[LOG] Ścieżka podstawowa niedostępna: {log_dir} "
+            f"[LOG] Sciezka podstawowa niedostepna: {log_dir} "
             f"({primary_error})"
         )
         print(f"[LOG] Zapis awaryjny: {filepath}")

@@ -3,11 +3,16 @@
 import tkinter as tk
 from tkinter import messagebox
 from datetime import datetime
+import queue
 import threading
 import time
-import os
-import re
+import traceback
 from logger import save_report
+from safety_rules import (
+    MIN_PRESENCE_CURRENT_MA,
+    validate_acw_profile,
+    validate_pass_evidence,
+)
 
 
 class TestScreen:
@@ -19,11 +24,31 @@ class TestScreen:
         self.model_name = model_name
         self.app_ref    = app_ref
         self.operator   = "OPERATOR"
+        # Profil jest zamrozony dla calej sesji ekranu testowego. Zmiana ustawien
+        # w panelu nie moze zmienic progow w trakcie aktywnego cyklu.
+        self.test_profile = validate_acw_profile(dict(config.TEST_PROFILE))
 
         self.device       = None
         self.test_running = False
+        self._result_pending = False
         self.test_thread  = None
         self.start_time   = None
+        self._device_configured = False
+        self._test_aborted = False
+        self._cycle_active_seen = False
+        self._cycle_load_seen = False
+        self._cycle_max_voltage = 0.0
+        self._cycle_max_current_ma = 0.0
+        self._cycle_in_range_samples = 0
+        self._cycle_overcurrent_seen = False
+        self._cycle_terminal_seen = False
+        self._run_id = 0
+
+        self._closed = False
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._ui_poll_after_id = None
+        self._next_dialog_after_id = None
+        self._report_threads: list[threading.Thread] = []
 
         self.current_voltage    = 0.0
         self.current_current    = 0.0
@@ -42,10 +67,8 @@ class TestScreen:
         self._lid_open_seen          = False
         self._valid_close_transition = False
 
-        # Pierwszy SN pochodzi z ekranu głównego i jest już zwalidowany.
+        # Pierwszy SN został już zwalidowany pod kątem długości i mapy HWID.
         self._serial_ready_for_test = True
-        self._duplicate_check_done  = True
-        self._duplicate_allowed     = True
 
         self.sn_dialog       = None
         self.sn_entry        = None
@@ -54,12 +77,14 @@ class TestScreen:
 
         self._recent_results          = []
         self._history_frame           = None
-        self._current_sn_is_duplicate = False
 
     # ------------------------------------------------------------------ #
     # SHOW                                                                 #
     # ------------------------------------------------------------------ #
     def show(self):
+        if self.app_ref is not None:
+            self.app_ref.current_test_screen = self
+        self._start_ui_poll()
         for widget in self.parent.winfo_children():
             widget.destroy()
 
@@ -80,9 +105,94 @@ class TestScreen:
         self._connect_device()
         self._connect_interlock()
 
-    # ------------------------------------------------------------------ #
-    # HEADER / FOOTER                                                      #
-    # ------------------------------------------------------------------ #
+
+    def _start_ui_poll(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                callback = self._ui_queue.get_nowait()
+                if not self._closed:
+                    try:
+                        callback()
+                    except tk.TclError:
+                        if not self._closed:
+                            print("[UI] Callback pominiety po zamknieciu okna")
+                    except Exception as exc:
+                        print(f"[UI] Krytyczny blad callbacku: {exc}")
+                        traceback.print_exc()
+                        try:
+                            if self.device:
+                                self.device.stop_test()
+                        except Exception:
+                            pass
+                        self._test_error(
+                            f"Wewnetrzny blad interfejsu: {exc}"
+                        )
+        except queue.Empty:
+            pass
+        if not self._closed:
+            self._ui_poll_after_id = self.parent.after(25, self._start_ui_poll)
+
+    def _post_ui(self, callback):
+        if not self._closed:
+            self._ui_queue.put(callback)
+
+    def shutdown(self):
+        """Fail-safe zamkniecie ekranu: STOP, rozlaczenie i anulowanie callbackow."""
+        if self._closed:
+            return
+        self._closed = True
+        self._test_aborted = True
+        self.test_running = False
+        self._result_pending = False
+        self._run_id += 1
+
+        for after_id in (self._ui_poll_after_id, self._next_dialog_after_id):
+            if after_id:
+                try:
+                    self.parent.after_cancel(after_id)
+                except Exception:
+                    pass
+        self._ui_poll_after_id = None
+        self._next_dialog_after_id = None
+
+        if self.sn_dialog and self.sn_dialog.winfo_exists():
+            try:
+                self.sn_dialog.grab_release()
+            except Exception:
+                pass
+            self.sn_dialog.destroy()
+            self.sn_dialog = None
+
+        try:
+            if self.device:
+                self.device.stop_test()
+        except Exception:
+            pass
+        try:
+            if self.interlock:
+                self.interlock.disconnect()
+        except Exception:
+            pass
+        try:
+            if self.device:
+                self.device.disconnect(send_stop=False)
+        except Exception:
+            pass
+
+        # Daj zapisom raportu lacznie maksymalnie sekunde na zakonczenie.
+        self._report_threads = [t for t in self._report_threads if t.is_alive()]
+        join_deadline = time.monotonic() + 1.0
+        for thread in self._report_threads:
+            remaining = join_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+        if self.app_ref is not None and self.app_ref.current_test_screen is self:
+            self.app_ref.current_test_screen = None
+
     def _create_header(self):
         header = tk.Frame(self.parent,
                           bg=self.config.COLOR_PRIMARY, height=70)
@@ -113,29 +223,26 @@ class TestScreen:
                           bg=self.config.COLOR_PRIMARY, height=40)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
         footer.pack_propagate(False)
+        tk.Label(footer, text=f"Wersja {self.config.APP_VERSION} — audyt bezpieczeństwa",
+                 bg=self.config.COLOR_PRIMARY, fg=self.config.COLOR_WHITE,
+                 font=("Arial", 9, "bold")).pack(
+                     side=tk.LEFT, padx=20, pady=10)
         tk.Label(footer, text="Autor: Kacper Urbanowicz",
                  bg=self.config.COLOR_PRIMARY, fg=self.config.COLOR_WHITE,
                  font=("Arial", 10, "bold")).pack(
                      side=tk.RIGHT, padx=20, pady=10)
 
     def _go_back(self):
-        if self.test_running:
+        if self.test_running or self._result_pending:
             messagebox.showwarning(
-                "Test w toku",
-                "Nie można wrócić do menu podczas testu!\n"
-                "Zatrzymaj test przyciskiem STOP.")
+                "Cykl w toku",
+                "Nie można wrócić do menu podczas testu ani finalizacji wyniku.\n"
+                "Poczekaj na wyświetlenie wyniku lub zatrzymaj aktywny test.")
             return
         self._cleanup_and_go_back()
 
     def _cleanup_and_go_back(self):
-        if self.sn_dialog and self.sn_dialog.winfo_exists():
-            self.sn_dialog.grab_release()
-            self.sn_dialog.destroy()
-            self.sn_dialog = None
-        if self.interlock:
-            self.interlock.disconnect()
-        if self.device:
-            self.device.disconnect()
+        self.shutdown()
         if self.app_ref:
             self.app_ref.show_scan_screen()
 
@@ -170,7 +277,7 @@ class TestScreen:
         self.sn_display_label.grid(row=0, column=3, sticky='w')
 
     def _create_test_params(self):
-        p = self.config.TEST_PROFILE
+        p = self.test_profile
 
         params_frame = tk.Frame(self.main_frame, bg=self.config.COLOR_WHITE,
                                 relief=tk.RAISED, borderwidth=2)
@@ -196,14 +303,20 @@ class TestScreen:
                          padx=(0, 30), pady=3)
 
         total = p['ramp_time'] + p['dwell'] + p['ramp_dn']
+        presence_min = float(p.get('presence_min_current', MIN_PRESENCE_CURRENT_MA))
+        effective_low = max(float(p['limit_low']), presence_min)
         lbl(0, 0, "Napięcie:",     f"{p['voltage'] / 1000:.2f} kV")
         lbl(0, 2, "Tryb:",         p['type'])
-        lbl(1, 0, "Limit prądu:",  f"{p['limit_low']:.3f} – {p['limit_high']:.3f} mA")
-        lbl(1, 2, "Czas całk.:",   f"{total:.1f} s")
-        lbl(2, 0, "Ramp up:",      f"{p['ramp_time']:.1f} s")
-        lbl(2, 2, "Dwell:",        f"{p['dwell']:.1f} s")
-        lbl(3, 0, "Częstotliw.:",  f"{p['frequency']} Hz")
-        lbl(3, 2, "Arc Sense:",    str(p['arc_sense']))
+        lbl(1, 0, "Limit Chromy:", f"{effective_low:.3f} – {p['limit_high']:.3f} mA")
+        lbl(1, 2, "Min. spec.:",   f"{p['limit_low']:.3f} mA")
+        lbl(2, 0, "Próg obecności:", f"{presence_min:.3f} mA")
+        lbl(2, 2, "Czas całk.:",   f"{total:.1f} s")
+        lbl(3, 0, "Ramp up:",      f"{p['ramp_time']:.1f} s")
+        lbl(3, 2, "Dwell:",        f"{p['dwell']:.1f} s")
+        lbl(4, 0, "Ramp down:",    f"{p['ramp_dn']:.1f} s")
+        lbl(4, 2, "Częstotliw.:",  f"{p['frequency']} Hz (ust. Chroma)")
+        lbl(5, 0, "Arc Sense:",    f"{p['arc_sense']} (ust. Chroma)")
+        lbl(5, 2, "Continuity:",   f"{p['continuity']} (ust. Chroma)")
 
     # ------------------------------------------------------------------ #
     # LIVE DISPLAY                                                         #
@@ -277,71 +390,82 @@ class TestScreen:
     def _connect_interlock(self):
         if not getattr(self.config, "INTERLOCK_ENABLED", True):
             self.interlock_label.config(
-                text="⚠ Interlock wyłączony — tryb ręczny",
-                fg="#FF9800", bg="#fff8e1")
-            self.start_button.config(state="normal")
+                text="⛔ Interlock programowy wyłączony — test zablokowany",
+                fg=self.config.COLOR_ERROR, bg="#ffebee")
+            self.interlock_frame.config(bg="#ffebee")
+            self.start_button.config(state="disabled")
             return
 
         port = getattr(self.config, "INTERLOCK_PORT", None)
         if not port:
             self.interlock_label.config(
-                text="⚠ Brak portu Arduino — tryb ręczny",
-                fg="#FF9800", bg="#fff8e1")
-            self.start_button.config(state="normal")
+                text="⛔ Brak portu Arduino — test zablokowany",
+                fg=self.config.COLOR_ERROR, bg="#ffebee")
+            self.interlock_frame.config(bg="#ffebee")
+            self.start_button.config(state="disabled")
             return
 
         from interlock import InterlockMonitor
         baud = getattr(self.config, "INTERLOCK_BAUDRATE", 9600)
-        self.interlock = InterlockMonitor(port=port, baudrate=baud)
+        self.interlock = InterlockMonitor(
+            port=port,
+            baudrate=baud,
+            heartbeat_timeout=2.0,
+        )
 
         if self.interlock.connect():
             self.interlock.set_on_change(self._on_interlock_change)
             self.interlock.start_monitoring()
             self.interlock_label.config(
-                text="⏳ Oczekiwanie na stan klapy...",
+                text="⏳ Oczekiwanie na aktualny stan klapy...",
                 fg="#FF9800", bg="#fff8e1")
             self.start_button.config(state="disabled")
         else:
             self.interlock_label.config(
-                text=f"✗ Błąd połączenia z Arduino ({port}) — tryb ręczny",
+                text=f"⛔ Brak komunikacji z Arduino ({port}) — test zablokowany",
                 fg=self.config.COLOR_ERROR, bg="#ffebee")
             self.interlock_frame.config(bg="#ffebee")
-            self.start_button.config(state="normal")
+            self.start_button.config(state="disabled")
 
     def _on_interlock_change(self, closed):
-        try:
-            self.parent.after(0, lambda: self._apply_interlock_state(closed))
-        except Exception:
-            pass
+        self._post_ui(lambda: self._apply_interlock_state(closed))
 
     def _interlock_enforced(self) -> bool:
-        """True, gdy interlock jest aktywny i połączony."""
+        """True, gdy konfiguracja wymaga programowego interlocka."""
+        return bool(getattr(self.config, "INTERLOCK_ENABLED", True))
+
+    def _interlock_ready(self) -> bool:
+        """True wyłącznie przy aktywnym połączeniu i znanym stanie klapy."""
         return bool(
-            getattr(self.config, "INTERLOCK_ENABLED", True)
+            self._interlock_enforced()
             and self.interlock
             and self.interlock.connected
+            and self._current_interlock_closed is not None
         )
 
     def _attempt_safe_start(self) -> bool:
-        """
-        Jedyna bramka automatycznego startu.
-
-        W trybie interlock wymagane są jednocześnie:
-        - poprawny, zatwierdzony SN,
-        - zakończona kontrola duplikatu,
-        - aktualny stan CLOSED,
-        - świeże przejście OPEN -> CLOSED.
-        """
-        if self.test_running:
+        """Jedyna bramka automatycznego startu testu."""
+        if self.test_running or self._result_pending or self._test_aborted:
             return False
         if not self.device or not self.device.connected:
+            self.status_label.config(
+                text="⛔ Start zablokowany — brak połączenia z Chroma",
+                fg=self.config.COLOR_ERROR)
+            return False
+        if not self._device_configured:
+            self.status_label.config(
+                text="⛔ Start zablokowany — Chroma nie jest poprawnie skonfigurowana",
+                fg=self.config.COLOR_ERROR)
             return False
         if not self._serial_ready_for_test:
             return False
-        if not self._duplicate_check_done or not self._duplicate_allowed:
-            return False
 
         if self._interlock_enforced():
+            if not self._interlock_ready():
+                self.status_label.config(
+                    text="⛔ Start zablokowany — brak aktualnego sygnału interlocka",
+                    fg=self.config.COLOR_ERROR)
+                return False
             if self._current_interlock_closed is not True:
                 self.status_label.config(
                     text="SN zaakceptowany — zamknij klapę, aby rozpocząć test",
@@ -356,11 +480,10 @@ class TestScreen:
             self._start_test()
             return True
 
-        # Tryb ręczny: nigdy nie uruchamiaj testu automatycznie po skanie.
-        self.start_button.config(state="normal")
+        self.start_button.config(state="disabled")
         self.status_label.config(
-            text="SN zaakceptowany — naciśnij START TEST",
-            fg="#FF9800")
+            text="⛔ Start zablokowany — interlock programowy musi być aktywny",
+            fg=self.config.COLOR_ERROR)
         return False
 
     def _apply_interlock_state(self, closed):
@@ -368,17 +491,34 @@ class TestScreen:
 
         if closed is None:
             self._valid_close_transition = False
+            self._lid_open_seen = False
+            self.start_button.config(state="disabled")
             self.interlock_label.config(
-                text="⚠ Utracono połączenie z Arduino — tryb ręczny",
-                fg="#FF9800", bg="#fff8e1")
-            self.interlock_frame.config(bg="#fff8e1")
-            if not self.test_running and self._serial_ready_for_test:
-                self.start_button.config(state="normal")
+                text="⛔ Utracono komunikację z Arduino — test zablokowany",
+                fg=self.config.COLOR_ERROR, bg="#ffebee")
+            self.interlock_frame.config(bg="#ffebee")
+
+            if self.test_running:
+                self._test_aborted = True
+                self.test_running = False
+                self._device_configured = False
+                self._serial_ready_for_test = False
+                if self.device:
+                    self.device.stop_test()
+                self.stop_button.config(state="disabled")
+                self.back_button.config(state="normal")
+                self.status_label.config(
+                    text="⛔ Test przerwany — utrata komunikacji z interlockiem",
+                    fg=self.config.COLOR_ERROR)
+                messagebox.showerror(
+                    "Utrata interlocka",
+                    "Utracono komunikację z Arduino podczas testu.\n"
+                    "Test został zatrzymany i kolejne uruchomienie jest zablokowane.",
+                    parent=self.parent)
             return
 
         if closed:
-            # Sam stan CLOSED nie może wystarczyć do startu. Akceptujemy
-            # wyłącznie rzeczywistą zmianę OPEN -> CLOSED.
+            # Sam stan CLOSED nie wystarcza. Akceptujemy tylko OPEN -> CLOSED.
             if self._prev_interlock_closed is not False or not self._lid_open_seen:
                 self._valid_close_transition = False
                 self.interlock_label.config(
@@ -389,8 +529,6 @@ class TestScreen:
                 self._prev_interlock_closed = True
                 return
 
-            # Ważne przejście OPEN -> CLOSED. Jest jednorazowe i zostanie
-            # skonsumowane przez _start_test().
             self._valid_close_transition = True
             self._lid_open_seen = False
             self.interlock_label.config(
@@ -407,7 +545,7 @@ class TestScreen:
             self._attempt_safe_start()
             return
 
-        # Stan OPEN uzbraja dokładnie jeden następny start po zamknięciu.
+        # OPEN uzbraja dokładnie jedno następne zamknięcie.
         self._lid_open_seen = True
         self._valid_close_transition = False
         self._prev_interlock_closed = False
@@ -417,12 +555,25 @@ class TestScreen:
         self.interlock_frame.config(bg="#ffebee")
 
         if self.test_running:
+            if self._cycle_terminal_seen:
+                # Tester zakonczyl juz generowanie HV. Nie kasujemy poprawnego
+                # wyniku tylko dlatego, ze operator szybko otworzyl klape.
+                self.start_button.config(state="disabled")
+                self.stop_button.config(state="disabled")
+                self.status_label.config(
+                    text="⏳ Test zakończony — finalizuję świeży wynik...",
+                    fg="#FF9800")
+                return
+
+            self._test_aborted = True
             self.test_running = False
+            self._device_configured = False
+            self._serial_ready_for_test = False
             if self.device:
                 self.device.stop_test()
-            self.start_button.config(state='disabled')
-            self.stop_button.config(state='disabled')
-            self.back_button.config(state='normal')
+            self.start_button.config(state="disabled")
+            self.stop_button.config(state="disabled")
+            self.back_button.config(state="normal")
             self.status_label.config(
                 text="⛔ Test przerwany — klapa została otwarta!",
                 fg=self.config.COLOR_ERROR)
@@ -430,14 +581,11 @@ class TestScreen:
                 "Test przerwany",
                 "Klapa została otwarta podczas testu!\n"
                 "Test został automatycznie zatrzymany.\n\n"
-                "Zeskanuj poprawny SN i zamknij klapę ponownie.",
+                "Wróć do menu, aby ponownie połączyć i skonfigurować tester.",
                 parent=self.parent)
         else:
             self.start_button.config(state="disabled")
 
-    # ------------------------------------------------------------------ #
-    # PRZYCISKI                                                            #
-    # ------------------------------------------------------------------ #
     def _create_control_buttons(self):
         bf = tk.Frame(self.main_frame, bg=self.config.COLOR_BG)
         bf.pack(fill=tk.X, pady=(0, 8))
@@ -519,26 +667,22 @@ class TestScreen:
             result_fg = (self.config.COLOR_ACCENT
                          if entry["result"] == "PASS"
                          else self.config.COLOR_ERROR)
-            dup_marker = " ⚠" if entry.get("duplicate") else ""
-
             for text, width, fg in [
-                (entry["time"],                   8,  "#666666"),
-                (entry["serial"] + dup_marker,   22,
-                 "#FF9800" if entry.get("duplicate") else "#333333"),
-                (entry["model"],                 16,  "#333333"),
-                (entry["result"],                 7,  result_fg),
+                (entry["time"],   8,  "#666666"),
+                (entry["serial"], 22, "#333333"),
+                (entry["model"],  16, "#333333"),
+                (entry["result"], 7,  result_fg),
             ]:
                 tk.Label(row, text=text, bg=bg, fg=fg,
                          font=("Arial", 8), width=width,
                          anchor="center", pady=2).pack(side=tk.LEFT)
 
-    def _add_recent_result(self, serial, model, result, duplicate=False):
+    def _add_recent_result(self, serial, model, result):
         self._recent_results.append({
-            "time":      datetime.now().strftime("%H:%M:%S"),
-            "serial":    serial,
-            "model":     model,
-            "result":    result,
-            "duplicate": duplicate,
+            "time":   datetime.now().strftime("%H:%M:%S"),
+            "serial": serial,
+            "model":  model,
+            "result": result,
         })
         if len(self._recent_results) > 5:
             self._recent_results = self._recent_results[-5:]
@@ -552,7 +696,10 @@ class TestScreen:
             from hipot_device import ChromaHiPotDevice
             self.device = ChromaHiPotDevice(
                 port=self.config.DEFAULT_COM_PORT,
-                baudrate=self.config.DEFAULT_BAUDRATE)
+                baudrate=self.config.DEFAULT_BAUDRATE,
+                parity=self.config.DEFAULT_PARITY,
+                flow_control=self.config.DEFAULT_FLOW_CONTROL,
+            )
             self.status_label.config(
                 text="Łączenie z urządzeniem Hi-Pot...", fg="#FF9800")
             if self.device.connect():
@@ -568,113 +715,257 @@ class TestScreen:
             self.start_button.config(state="disabled")
 
     def _configure_device(self):
+        self._device_configured = False
+        self.start_button.config(state="disabled")
         try:
             self.device.clear_steps()
-            self.device.configure_acw(self.config.TEST_PROFILE)
+            self.device.configure_acw(self.test_profile)
+            self._device_configured = True
             self.status_label.config(
                 text="✓ Urządzenie skonfigurowane i gotowe",
                 fg=self.config.COLOR_ACCENT)
+            self._attempt_safe_start()
         except Exception as e:
+            self._device_configured = False
             self.status_label.config(
-                text=f"✗ Błąd konfiguracji: {e}",
+                text=f"⛔ Błąd konfiguracji — test zablokowany: {e}",
                 fg=self.config.COLOR_ERROR)
+            self.start_button.config(state="disabled")
 
-    # ------------------------------------------------------------------ #
-    # LOGIKA TESTU                                                         #
-    # ------------------------------------------------------------------ #
     def _start_test(self):
-        if self.test_running:
+        if self._closed or self.test_running or self._result_pending or self._test_aborted:
             return
 
-        # Obrona ostatniej linii: nawet przypadkowe wywołanie tej metody
-        # nie ominie interlocka ani kontroli numeru seryjnego.
-        if self._interlock_enforced():
-            if self._current_interlock_closed is not True:
-                self.status_label.config(
-                    text="⛔ Start zablokowany — klapa jest otwarta",
-                    fg=self.config.COLOR_ERROR)
-                return
-            if not self._valid_close_transition:
-                self.status_label.config(
-                    text="⛔ Start zablokowany — wymagane otwarcie i ponowne zamknięcie klapy",
-                    fg=self.config.COLOR_ERROR)
-                return
-            if not self._serial_ready_for_test:
-                self.status_label.config(
-                    text="⛔ Start zablokowany — brak zatwierdzonego SN",
-                    fg=self.config.COLOR_ERROR)
-                return
-            if not self._duplicate_check_done or not self._duplicate_allowed:
-                self.status_label.config(
-                    text="⏳ Start zablokowany — trwa kontrola numeru seryjnego",
-                    fg="#FF9800")
-                return
+        # Ostatnia linia obrony — obowiązuje także w trybie ręcznym.
+        if not self.device or not self.device.connected:
+            self.status_label.config(
+                text="⛔ Start zablokowany — brak połączenia z Chroma",
+                fg=self.config.COLOR_ERROR)
+            return
+        if not self._device_configured:
+            self.status_label.config(
+                text="⛔ Start zablokowany — brak potwierdzonej konfiguracji Chromy",
+                fg=self.config.COLOR_ERROR)
+            return
+        if not self._serial_ready_for_test:
+            self.status_label.config(
+                text="⛔ Start zablokowany — brak zatwierdzonego SN",
+                fg=self.config.COLOR_ERROR)
+            return
 
-            # Przejście OPEN -> CLOSED jest jednorazowe.
-            self._valid_close_transition = False
+        if not self._interlock_enforced():
+            self.status_label.config(
+                text="⛔ Start zablokowany — interlock programowy jest wyłączony",
+                fg=self.config.COLOR_ERROR)
+            return
+        if not self._interlock_ready():
+            self.status_label.config(
+                text="⛔ Start zablokowany — brak aktualnego sygnału interlocka",
+                fg=self.config.COLOR_ERROR)
+            return
+        if self._current_interlock_closed is not True:
+            self.status_label.config(
+                text="⛔ Start zablokowany — klapa jest otwarta",
+                fg=self.config.COLOR_ERROR)
+            return
+        if not self._valid_close_transition:
+            self.status_label.config(
+                text="⛔ Start zablokowany — wymagane otwarcie i ponowne zamknięcie klapy",
+                fg=self.config.COLOR_ERROR)
+            return
+        self._valid_close_transition = False
 
         self._test_completed_called = False
+        self._test_aborted = False
+        self._result_pending = False
+        self._cycle_active_seen = False
+        self._cycle_load_seen = False
+        self._cycle_max_voltage = 0.0
+        self._cycle_max_current_ma = 0.0
+        self._cycle_in_range_samples = 0
+        self._cycle_overcurrent_seen = False
+        self._cycle_terminal_seen = False
+        self._run_id += 1
+        run_id = self._run_id
         self.test_running = True
-        self.start_time   = time.time()
+        self.start_time = time.monotonic()
 
         self.sn_display_label.config(text=self.serial)
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.back_button.config(state="disabled")
         self.next_sn_button.config(state="disabled")
-        self.status_label.config(text="🔄 Test w toku...", fg="#FF9800")
+        self.status_label.config(
+            text="🔄 Uruchamianie nowego cyklu Hi-Pot...", fg="#FF9800"
+        )
 
         self.test_thread = threading.Thread(
-            target=self._run_test_background, daemon=True)
+            target=self._run_test_background, args=(run_id,), daemon=True)
         self.test_thread.start()
 
-    def _run_test_background(self):
+    def _run_test_background(self, run_id):
         try:
-            self.device.start_test()
-            p          = self.config.TEST_PROFILE
-            total_time = p['ramp_time'] + p['dwell'] + p['ramp_dn']
+            if not self.device.start_test():
+                raise RuntimeError(
+                    "Chroma nie potwierdziła rozpoczęcia NOWEGO cyklu testowego. "
+                    "Wynik LAST nie został użyty."
+                )
 
-            time.sleep(1.5)
-            if not self.test_running:
-                return
+            # start_test() potwierdził aktywny stan lub świeże narastanie napięcia.
+            self._cycle_active_seen = True
 
-            while self.test_running:
-                status  = self.device.get_status()
-                elapsed = time.time() - self.start_time
+            profile = self.test_profile
+            target_voltage = float(profile["voltage"])
+            low_limit_ma = float(profile["limit_low"])
+            presence_min_ma = float(profile.get("presence_min_current", MIN_PRESENCE_CURRENT_MA))
+            effective_low_ma = max(low_limit_ma, presence_min_ma)
+            high_limit_ma = float(profile["limit_high"])
+            print(
+                f"[LOAD] Próg obecności: {presence_min_ma:.3f} mA | "
+                f"efektywny LOW: {effective_low_ma:.3f} mA"
+            )
+            total_time = (
+                float(profile["ramp_time"])
+                + float(profile["dwell"])
+                + float(profile["ramp_dn"])
+            )
+            # Wynik zakończony dużo wcześniej niż profil jest podejrzany/stary.
+            minimum_runtime = max(2.0, total_time - 0.75)
+            configured_timeout = max(1.0, float(getattr(self.config, "TEST_TIMEOUT", 300)))
+            max_runtime = min(configured_timeout, max(total_time + 10.0, 15.0))
+            consecutive_comm_errors = 0
+            terminal_status = None
 
-                if status == "STOPPED" and elapsed >= 2.0:
-                    break
+            while (
+                self.test_running
+                and not self._test_aborted
+                and not self._closed
+                and run_id == self._run_id
+            ):
+                elapsed = time.monotonic() - self.start_time
+                status = self.device.get_status()
+
+                if status == "COMM_ERROR":
+                    consecutive_comm_errors += 1
+                    if consecutive_comm_errors >= 3:
+                        raise RuntimeError(
+                            "Utracono komunikację z Chroma podczas testu"
+                        )
+                    time.sleep(0.15)
+                    continue
+
+                consecutive_comm_errors = 0
+                if status in ("TESTING", "RUNNING"):
+                    self._cycle_active_seen = True
 
                 measurements = self.device.read_measurements()
                 if measurements:
-                    v = measurements['output_voltage']
-                    i = measurements['measure_current'] * 1000  # A → mA
-                    self.current_voltage = v
-                    self.current_current = i
-                    if 0 < v < 1e6:
-                        self.last_valid_voltage = v
-                    if 0 < i < 9999:
-                        self.last_valid_current = i
+                    voltage = float(measurements["output_voltage"])
+                    current_ma = float(measurements["measure_current"]) * 1000.0
+                    self.current_voltage = voltage
+                    self.current_current = current_ma
+                    self._cycle_max_voltage = max(self._cycle_max_voltage, voltage)
+                    self._cycle_max_current_ma = max(
+                        self._cycle_max_current_ma, current_ma
+                    )
 
-                self.elapsed_time = time.time() - self.start_time
-                self.parent.after(0, self._update_display)
+                    if voltage >= 50.0:
+                        self._cycle_active_seen = True
+                    # Potwierdzenie obciążenia musi pochodzić z pomiaru NA ŻYWO,
+                    # nie z rejestru LAST poprzedniego urządzenia.
+                    if voltage >= target_voltage * 0.90:
+                        if effective_low_ma <= current_ma <= high_limit_ma:
+                            self._cycle_in_range_samples += 1
+                            self._cycle_load_seen = True
+                        elif current_ma > high_limit_ma:
+                            self._cycle_overcurrent_seen = True
 
-                if self.elapsed_time > total_time + 5:
+                    if 0 < voltage < 1e6:
+                        self.last_valid_voltage = voltage
+                    if 0 < current_ma < 9999:
+                        self.last_valid_current = current_ma
+
+                self.elapsed_time = elapsed
+                self._post_ui(self._update_display)
+
+                if status in ("STOPPED", "STOP", "PASS", "FAIL"):
+                    terminal_status = status
+                    self._cycle_terminal_seen = True
+                    if not self._cycle_active_seen:
+                        raise RuntimeError(
+                            "Odebrano wynik bez potwierdzenia aktywnego cyklu — "
+                            "możliwy stary wynik LAST"
+                        )
+                    # Wczesny FAIL jest prawidlowym wynikiem ochronnym (np. ARC
+                    # lub przekroczenie pradu). Minimalny czas sprawdzamy dopiero
+                    # po odczycie wyniku i odrzucamy wylacznie podejrzanie szybki PASS.
                     break
 
-                time.sleep(0.1)
+                if elapsed > max_runtime:
+                    raise TimeoutError(
+                        f"Przekroczono maksymalny czas testu ({max_runtime:.1f} s)"
+                    )
+                time.sleep(0.10)
 
-            self.parent.after(0, self._test_completed)
+            if (
+                self._test_aborted
+                or not self.test_running
+                or self._closed
+                or run_id != self._run_id
+            ):
+                return
+            if terminal_status is None:
+                raise RuntimeError("Brak jednoznacznego zakończenia bieżącego cyklu")
 
-        except Exception as e:
-            self.parent.after(0, lambda: self._test_error(str(e)))
+            result, data = self.device.get_test_result()
+            if result not in ("PASS", "FAIL"):
+                raise RuntimeError(
+                    "Nie udało się pobrać jednoznacznego, świeżego wyniku testu"
+                )
+            if not data.get("fresh_cycle"):
+                raise RuntimeError("Wynik nie został przypisany do bieżącego cyklu")
+            if result == "PASS" and elapsed < minimum_runtime:
+                raise RuntimeError(
+                    f"PASS pojawił się zbyt szybko ({elapsed:.1f} s; "
+                    f"minimum {minimum_runtime:.1f} s) — wynik odrzucony"
+                )
+
+            final_voltage = float(data.get("output_voltage") or 0.0)
+            final_current_ma = float(data.get("measured_current") or 0.0)
+            validate_pass_evidence(
+                result=result,
+                terminal_status=terminal_status,
+                target_voltage=target_voltage,
+                effective_low_ma=effective_low_ma,
+                high_limit_ma=high_limit_ma,
+                final_voltage=final_voltage,
+                final_current_ma=final_current_ma,
+                cycle_max_voltage=self._cycle_max_voltage,
+                in_range_samples=self._cycle_in_range_samples,
+                overcurrent_seen=self._cycle_overcurrent_seen,
+            )
+
+            # Wynik jest juz zweryfikowany. Otwarcie klapy po tym punkcie nie moze
+            # zmienic zakonczonego cyklu w falszywe "przerwano test".
+            self._result_pending = True
+            self.test_running = False
+            self._post_ui(lambda r=result, d=data: self._test_completed(r, d))
+
+        except Exception as exc:
+            if self._test_aborted or self._closed or run_id != self._run_id:
+                return
+            try:
+                self.device.stop_test()
+            except Exception:
+                pass
+            self._post_ui(lambda msg=str(exc): self._test_error(msg))
 
     def _update_display(self):
         self.voltage_label.config(text=f"{int(self.current_voltage)} V")
         self.current_label.config(text=f"{self.current_current:.2f} mA")
         self.time_label.config(text=f"{self.elapsed_time:.1f} s")
 
-        p          = self.config.TEST_PROFILE
+        p          = self.test_profile
         total_time = p['ramp_time'] + p['dwell'] + p['ramp_dn']
         progress   = min(self.elapsed_time / total_time, 1.0) \
                      if total_time > 0 else 0
@@ -682,98 +973,167 @@ class TestScreen:
         self.progress_canvas.coords(
             self.progress_rect, 0, 0, cw * progress, 30)
 
-    def _test_completed(self):
-        if self._test_completed_called:
+    def _test_completed(self, result, data):
+        if self._test_completed_called or self._test_aborted or self._closed:
+            self._result_pending = False
             return
         self._test_completed_called = True
         self.test_running = False
+        self._result_pending = False
 
-        # Po każdym zakończonym teście wymuszamy nowy pełny cykl:
-        # OPEN -> nowy SN -> CLOSED. Zamknięta klapa po poprzednim teście
-        # nie może uruchomić kolejnego urządzenia.
+        # Każdy następny test wymaga nowego SN i nowego OPEN -> CLOSED.
         self._serial_ready_for_test = False
-        self._duplicate_check_done  = False
-        self._duplicate_allowed     = False
         self._valid_close_transition = False
-        self._lid_open_seen          = False
+        # Gdy operator zdazyl juz otworzyc klape po fizycznym zakonczeniu HV,
+        # zachowujemy to OPEN. Nie wymagamy bezsensownego drugiego otwarcia.
+        self._lid_open_seen = self._current_interlock_closed is False
+        if self._lid_open_seen:
+            self._prev_interlock_closed = False
 
-        result, data = self.device.get_test_result()
         self.test_result = result
-
         self.start_button.config(state="disabled")
         self.stop_button.config(state="disabled")
         self.back_button.config(state="normal")
         self.next_sn_button.config(state="normal")
 
+        lid_instruction = (
+            "zeskanuj następny SN i zamknij klapę"
+            if self._current_interlock_closed is False
+            else "otwórz klapę"
+        )
         if result == "PASS":
             self.status_label.config(
-                text="✓ TEST ZALICZONY (PASS)",
+                text=f"✓ TEST ZALICZONY (PASS) — {lid_instruction}",
                 fg=self.config.COLOR_ACCENT)
         else:
             self.status_label.config(
-                text="✗ TEST NIEZALICZONY (FAIL)",
+                text=f"✗ TEST NIEZALICZONY (FAIL) — {lid_instruction}",
                 fg=self.config.COLOR_ERROR)
 
-        # Napięcie i prąd do logu
-        OVERFLOW = 9.0e+37
-        if data:
-            try:
-                raw_v  = float(data.get("output_voltage")   or 0)
-                raw_mi = float(data.get("measured_current") or 0)
-            except (TypeError, ValueError):
-                raw_v, raw_mi = 0.0, 0.0
-            vtm_val = (raw_v / 1000 if 0 < raw_v < OVERFLOW
-                       else self.last_valid_voltage / 1000)
-            im_val  = (raw_mi if 0 < raw_mi < 9999
-                       else self.last_valid_current)
-        else:
-            vtm_val = self.last_valid_voltage / 1000
-            im_val  = self.last_valid_current
-
-        error_code = str(data.get("error_code", "")) if data else ""
-
-        # Zapis raportu
+        overflow = 9.0e37
         try:
-            save_report(
-                operator   = self.operator,
-                program    = self.model_name,
-                serial     = self.serial,
-                vtm        = vtm_val,
-                im         = im_val,
-                result     = result,
-                error_code = error_code,
-                log_dir    = self.config.LOG_DIR,
+            raw_v = float(data.get("output_voltage") or 0)
+            raw_mi = float(data.get("measured_current") or 0)
+        except (TypeError, ValueError):
+            raw_v, raw_mi = 0.0, 0.0
+
+        vtm_val = (
+            raw_v / 1000.0
+            if 0 < raw_v < overflow
+            else self.last_valid_voltage / 1000.0
+        )
+        im_val = (
+            raw_mi if 0 < raw_mi < 9999 else self.last_valid_current
+        )
+        error_code = str(data.get("error_code", ""))
+
+        # Kopie wartości chronią zapis przed zmianą SN w kolejnym cyklu.
+        report_args = {
+            "operator": self.operator,
+            "program": self.model_name,
+            "serial": self.serial,
+            "vtm": vtm_val,
+            "im": im_val,
+            "result": result,
+            "error_code": error_code,
+            "low_limit": max(
+                float(self.test_profile.get("limit_low", 0.05)),
+                float(self.test_profile.get("presence_min_current", MIN_PRESENCE_CURRENT_MA)),
+            ),
+            "high_limit": float(self.test_profile.get("limit_high", 2.5)),
+            "log_dir": self.config.LOG_DIR,
+        }
+        if getattr(self.config, "AUTO_SAVE_RESULTS", True):
+            self._report_threads = [
+                thread for thread in self._report_threads if thread.is_alive()
+            ]
+            report_thread = threading.Thread(
+                target=self._save_report_background,
+                args=(report_args,),
+                daemon=True,
             )
-        except Exception as e:
-            print(f"[LOG] Błąd zapisu: {e}")
+            self._report_threads.append(report_thread)
+            report_thread.start()
 
         self._add_recent_result(
-            serial    = self.serial,
-            model     = self.model_name,
-            result    = result,
-            duplicate = self._current_sn_is_duplicate,
+            serial=self.serial,
+            model=self.model_name,
+            result=result,
         )
 
         if self._interlock_enforced():
-            self.interlock_label.config(
-                text="🔒 Test zakończony — otwórz klapę przed następnym testem",
-                fg="#FF9800", bg="#fff8e1")
-            self.interlock_frame.config(bg="#fff8e1")
+            if self._current_interlock_closed is False:
+                text = "🔓 Test zakończony — zeskanuj następny SN i zamknij klapę"
+                fg, bg = self.config.COLOR_ERROR, "#ffebee"
+            else:
+                text = "🔒 Test zakończony — otwórz klapę przed następnym testem"
+                fg, bg = "#FF9800", "#fff8e1"
+            self.interlock_label.config(text=text, fg=fg, bg=bg)
+            self.interlock_frame.config(bg=bg)
 
-        self.parent.after(2000,
-            lambda: self._show_next_sn_dialog(result))
+        # Okno następnego SN pojawia się praktycznie natychmiast.
+        self._next_dialog_after_id = self.parent.after(
+            300, lambda: None if self._closed else self._show_next_sn_dialog(result)
+        )
+
+    def _save_report_background(self, report_args):
+        try:
+            save_report(**report_args)
+        except Exception as exc:
+            print(f"[LOG] Błąd zapisu raportu: {exc}")
+            self._post_ui(
+                lambda error=str(exc): messagebox.showerror(
+                    "Błąd zapisu raportu",
+                    f"Nie udało się zapisać raportu ani kopii awaryjnej:\n{error}",
+                    parent=self.parent,
+                )
+            )
 
     def _test_error(self, msg):
+        if self._closed:
+            return
+        self._test_aborted = True
         self.test_running = False
-        self.start_button.config(state="normal")
+        self._result_pending = False
+        self._device_configured = False
+        self._serial_ready_for_test = False
+        self._valid_close_transition = False
+        self._cycle_terminal_seen = False
+
+        try:
+            if self.device:
+                self.device.disconnect()
+        except Exception:
+            pass
+
+        self.start_button.config(state="disabled")
         self.stop_button.config(state="disabled")
         self.back_button.config(state="normal")
         self.next_sn_button.config(state="disabled")
         self.status_label.config(
-            text=f"✗ Błąd testu: {msg}", fg=self.config.COLOR_ERROR)
+            text=f"⛔ Błąd testu — dalsze testy zablokowane: {msg}",
+            fg=self.config.COLOR_ERROR)
+        messagebox.showerror(
+            "Błąd testu Hi-Pot",
+            f"{msg}\n\nDalsze testy zostały zablokowane. "
+            "Wróć do menu i połącz urządzenie ponownie.",
+            parent=self.parent)
 
     def _stop_test(self):
+        if self._closed:
+            return
+        if self._result_pending:
+            self.status_label.config(
+                text="⏳ Wynik jest finalizowany — STOP nie jest już wymagany",
+                fg="#FF9800",
+            )
+            return
+        self._test_aborted = True
         self.test_running = False
+        self._device_configured = False
+        self._serial_ready_for_test = False
+        self._valid_close_transition = False
+        self._cycle_terminal_seen = False
         if self.device:
             self.device.stop_test()
         self.start_button.config(state="disabled")
@@ -781,81 +1141,16 @@ class TestScreen:
         self.back_button.config(state="normal")
         self.next_sn_button.config(state="disabled")
         self.status_label.config(
-            text="⚠ Test przerwany przez użytkownika", fg="#FF9800")
+            text="⚠ Test przerwany przez użytkownika — wymagany nowy cykl",
+            fg="#FF9800")
 
-    # ------------------------------------------------------------------ #
-    # DUPLIKAT SN                                                          #
-    # ------------------------------------------------------------------ #
-    def _check_serial_duplicate(self, serial: str) -> dict:
-        # Sprawdź w historii sesji
-        for entry in self._recent_results:
-            if entry["serial"].upper() == serial.upper():
-                return {"found": True, "where": "session",
-                        "last_time": entry["time"],
-                        "last_result": entry["result"]}
 
-        # Sprawdź w plikach logów
-        log_dir = getattr(self.config, "LOG_DIR", "logs")
-        if not os.path.isdir(log_dir):
-            return {"found": False, "where": None,
-                    "last_time": None, "last_result": None}
-
-        pattern = re.compile(
-            r'^' + re.escape(serial.upper()) + r'_(\d{14})\.txt$',
-            re.IGNORECASE)
-
-        matches = []
-        try:
-            for fname in os.listdir(log_dir):
-                m = pattern.match(fname)
-                if not m:
-                    continue
-                try:
-                    ts = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
-                except ValueError:
-                    continue
-                matches.append((m.group(1), fname))
-        except Exception:
-            return {"found": False, "where": None,
-                    "last_time": None, "last_result": None}
-
-        if not matches:
-            return {"found": False, "where": None,
-                    "last_time": None, "last_result": None}
-
-        matches.sort(key=lambda x: x[0], reverse=True)
-        latest_ts, latest_fname = matches[0]
-
-        try:
-            dt        = datetime.strptime(latest_ts, "%Y%m%d%H%M%S")
-            last_time = dt.strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            last_time = latest_ts
-
-        last_result = None
-        try:
-            with open(os.path.join(log_dir, latest_fname),
-                      encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if line.strip().lower().startswith("total result:"):
-                        val = line.split(":", 1)[-1].strip().upper()
-                        last_result = "PASS" if val == "PASS" else "FAIL"
-                        break
-        except Exception:
-            pass
-
-        return {"found": True, "where": "logs",
-                "last_time": last_time, "last_result": last_result}
-
-    # ------------------------------------------------------------------ #
-    # OKNO NASTĘPNY SN                                                     #
-    # ------------------------------------------------------------------ #
     def _open_sn_dialog_manually(self):
         if self.sn_dialog and self.sn_dialog.winfo_exists():
             self.sn_dialog.lift()
             self.sn_dialog.focus()
             return
-        self._show_next_sn_dialog(self.test_result or "PASS")
+        self._show_next_sn_dialog(self.test_result or "BRAK")
 
     def _show_next_sn_dialog(self, result):
         if self.sn_dialog and self.sn_dialog.winfo_exists():
@@ -870,6 +1165,7 @@ class TestScreen:
         dialog.transient(self.parent)
         dialog.grab_set()
         dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", self._back_from_dialog)
         dialog.update_idletasks()
         x = self.parent.winfo_screenwidth()  // 2 - 225
         y = self.parent.winfo_screenheight() // 2 - 130
@@ -950,9 +1246,6 @@ class TestScreen:
         self.sn_dialog.destroy()
         self.sn_dialog = None
 
-        threading.Thread(
-            target=self._check_duplicate_async,
-            args=(new_serial,), daemon=True).start()
         return True
 
     def _confirm_next_sn(self):
@@ -970,108 +1263,51 @@ class TestScreen:
         self.sn_dialog.destroy()
         self.sn_dialog = None
 
-        threading.Thread(
-            target=self._check_duplicate_async,
-            args=(new_serial,), daemon=True).start()
+        self._attempt_safe_start()
 
     def _apply_new_serial(self, new_serial: str, model_name: str):
         """Wspólna logika resetu stanu po podaniu nowego SN."""
-        self.serial     = new_serial
+        self.serial = new_serial
         self.model_name = model_name
-        self._current_sn_is_duplicate = False
+        self._test_aborted = False
+        self._cycle_active_seen = False
+        self._cycle_load_seen = False
+        self._cycle_max_voltage = 0.0
+        self._cycle_max_current_ma = 0.0
+        self._cycle_in_range_samples = 0
+        self._cycle_overcurrent_seen = False
+        self._cycle_terminal_seen = False
 
         self._serial_ready_for_test = True
-        self._duplicate_check_done  = False
-        self._duplicate_allowed     = False
         self.start_button.config(state="disabled")
+        self.next_sn_button.config(state="disabled")
 
         self.sn_display_label.config(text=self.serial)
-        self.test_result        = None
-        self.elapsed_time       = 0.0
-        self.current_voltage    = 0.0
-        self.current_current    = 0.0
+        self.test_result = None
+        self.elapsed_time = 0.0
+        self.current_voltage = 0.0
+        self.current_current = 0.0
         self.last_valid_voltage = 0.0
         self.last_valid_current = 0.0
         self.voltage_label.config(text="0 V")
         self.current_label.config(text="0.00 mA")
         self.time_label.config(text="0.0 s")
         self.progress_canvas.coords(self.progress_rect, 0, 0, 0, 30)
+
         if self._interlock_enforced():
-            if self._current_interlock_closed is True and not self._valid_close_transition:
-                msg = "SN zaakceptowany — otwórz klapę i zamknij ją ponownie"
+            if not self._interlock_ready():
+                message = "SN zaakceptowany — oczekiwanie na interlock"
+            elif self._current_interlock_closed is True and not self._valid_close_transition:
+                message = "SN zaakceptowany — otwórz klapę i zamknij ją ponownie"
             elif self._current_interlock_closed is False:
-                msg = "SN zaakceptowany — zamknij klapę po włożeniu urządzenia"
+                message = "SN zaakceptowany — zamknij klapę po włożeniu urządzenia"
             else:
-                msg = "SN zaakceptowany — oczekiwanie na interlock"
-            self.status_label.config(text=msg, fg="#FF9800")
+                message = "SN zaakceptowany — gotowy do uruchomienia"
+            self.status_label.config(text=message, fg="#FF9800")
         else:
             self.status_label.config(
-                text="Sprawdzanie numeru seryjnego...", fg="#FF9800")
+                text="SN zaakceptowany — naciśnij START TEST", fg="#FF9800")
 
-    def _check_duplicate_async(self, serial: str):
-        try:
-            dup = self._check_serial_duplicate(serial)
-            self._current_sn_is_duplicate = dup["found"]
-
-            if dup["found"]:
-                where_txt  = ("tej sesji" if dup["where"] == "session"
-                              else f"logów ({dup['last_time']})")
-                result_txt = (f" (wynik: {dup['last_result']})"
-                              if dup["last_result"] else "")
-
-                def show_warning():
-                    self.status_label.config(
-                        text=f"⚠ DUPLIKAT: SN {serial} był już testowany"
-                             f" — {where_txt}{result_txt}",
-                        fg="#E65100")
-                    ans = messagebox.askyesno(
-                        "Duplikat SN!",
-                        f"SN {serial} był już testowany!\n"
-                        f"{where_txt}{result_txt}\n\n"
-                        f"Na pewno chcesz kontynuować?",
-                        parent=self.parent)
-
-                    self._duplicate_check_done = True
-                    self._duplicate_allowed = bool(ans)
-
-                    if ans:
-                        self._attempt_safe_start()
-                    else:
-                        self._serial_ready_for_test = False
-                        self._valid_close_transition = False
-                        self.status_label.config(
-                            text="Test anulowany — zeskanuj inny numer seryjny",
-                            fg=self.config.COLOR_ERROR)
-                        self._show_next_sn_dialog(self.test_result or "PASS")
-
-                self.parent.after(0, show_warning)
-            else:
-                def approve_serial():
-                    self._duplicate_check_done = True
-                    self._duplicate_allowed = True
-                    self._attempt_safe_start()
-
-                self.parent.after(0, approve_serial)
-
-        except Exception as e:
-            print(f"[DUP] Błąd: {e}")
-
-            def fail_safe():
-                # Błąd kontroli nie może automatycznie uruchomić wysokiego napięcia.
-                self._duplicate_check_done = False
-                self._duplicate_allowed = False
-                self._valid_close_transition = False
-                self.start_button.config(state="disabled")
-                self.status_label.config(
-                    text="⛔ Nie udało się sprawdzić SN — test zablokowany",
-                    fg=self.config.COLOR_ERROR)
-                messagebox.showerror(
-                    "Kontrola numeru seryjnego",
-                    "Nie udało się sprawdzić, czy numer seryjny był już testowany.\n"
-                    "Test nie został uruchomiony.",
-                    parent=self.parent)
-
-            self.parent.after(0, fail_safe)
 
     def _back_from_dialog(self):
         if self.sn_dialog and self.sn_dialog.winfo_exists():

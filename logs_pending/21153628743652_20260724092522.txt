@@ -1,0 +1,18 @@
+Chroma 19052 Test report
+
+Program:	ESD-160S/VE
+S/N:		21153628743652
+TIME:		2026/07/24 09:25:22
+Total result:	Pass
+
+STEP:		1
+MODE:		WVAC
+EXT Name:	
+Vtm:		3.999	KV
+Im:		1.729	mA
+Low:		0.500	mA
+High:		2.500	mA
+Result:		Pass
+Error Code:	
+
+Error Description: 

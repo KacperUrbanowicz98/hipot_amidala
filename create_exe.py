@@ -1,36 +1,16 @@
-r"""
-Builder aplikacji Reconext Hi-Pot Amidala dla Windows.
+"""Builder EXE dla aplikacji Reconext Hi-Pot Amidala.
 
-Funkcje:
-- budowa PyInstaller w trybie ONEDIR (cały folder aplikacji),
-- brak UPX, co zwykle zmniejsza liczbę fałszywych alarmów AV,
-- metadane wersji Windows,
-- kopiowanie edytowalnych JSON-ów obok EXE,
-- ustawienie katalogu roboczego na folder EXE,
-- opcjonalne/obowiązkowe podpisanie Authenticode przez SignTool,
-- weryfikacja podpisu i zapis manifestu SHA-256.
-
-Zalecane podpisywanie certyfikatem z magazynu Windows:
-    set AMIDALA_SIGN_CERT_SHA1=ODCISK_CERTYFIKATU_BEZ_SPACJI
-    python create_exe.py
-
-Alternatywnie certyfikat PFX:
-    set AMIDALA_SIGN_PFX=C:\certyfikaty\reconext-code-signing.pfx
-    set AMIDALA_SIGN_PFX_PASSWORD=haslo
-    python create_exe.py
-
-Domyślnie podpis jest WYMAGANY. Do lokalnego builda testowego bez podpisu:
-    set AMIDALA_REQUIRE_SIGNING=0
-    python create_exe.py
+Buduje aplikacje PyInstallerem w trybie ONEDIR bez podpisu cyfrowego.
+Pliki amidala_config.json i hwid_map.json pozostaja obok EXE i moga
+byc edytowane z panelu administratora.
 """
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import importlib.util
+import importlib.metadata
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -38,13 +18,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
+from config import APP_VERSION as SOURCE_APP_VERSION
+
 
 APP_NAME = "Hi-Pot Amidala"
-APP_DESCRIPTION = "Reconext Hi-Pot Amidala Tester"
+APP_DESCRIPTION = "Hi-Pot Amidala Tester"
 COMPANY_NAME = "Reconext"
-VERSION = "1.0.0.0"
+VERSION = f"{SOURCE_APP_VERSION}.0"
 COPYRIGHT = "Reconext 2026"
-ENTRY_POINT = "main.py"
+
+REQUIRED_PYTHON = (3, 13)
+REQUIRED_PACKAGES = {
+    "PyInstaller": ("pyinstaller", "6.21.0"),
+    "serial": ("pyserial", "3.5"),
+}
 
 ROOT_DIR = Path(__file__).resolve().parent
 DIST_DIR = ROOT_DIR / "dist"
@@ -53,8 +40,6 @@ STAGING_DIR = BUILD_DIR / "_amidala_staging"
 OUTPUT_DIR = DIST_DIR / APP_NAME
 EXE_PATH = OUTPUT_DIR / f"{APP_NAME}.exe"
 
-# Pliki źródłowe muszą w stagingu mieć te dokładne nazwy,
-# ponieważ takie moduły są importowane w aplikacji.
 PROJECT_FILES = [
     "main.py",
     "gui.py",
@@ -66,9 +51,10 @@ PROJECT_FILES = [
     "logger.py",
     "settings_manager.py",
     "hwid_map.py",
+    "safety_rules.py",
+    "runtime_logging.py",
 ]
 
-# Te pliki mają pozostać edytowalne po zbudowaniu aplikacji.
 EDITABLE_DATA_FILES = [
     "amidala_config.json",
     "hwid_map.json",
@@ -79,16 +65,13 @@ OPTIONAL_DATA_FILES = [
 ]
 
 HIDDEN_IMPORTS = [
-    # GUI
     "tkinter",
     "tkinter.ttk",
     "tkinter.messagebox",
     "tkinter.filedialog",
-    # RS232 / pyserial
     "serial",
     "serial.tools.list_ports",
     "serial.tools.list_ports_windows",
-    # Moduły projektu, także importowane wewnątrz metod
     "config",
     "gui",
     "admin_panel",
@@ -98,39 +81,50 @@ HIDDEN_IMPORTS = [
     "logger",
     "settings_manager",
     "hwid_map",
+    "safety_rules",
+    "runtime_logging",
 ]
 
-TIMESTAMP_URL = os.environ.get(
-    "AMIDALA_TIMESTAMP_URL",
-    "http://timestamp.digicert.com",
-).strip()
 
-REQUIRE_SIGNING = os.environ.get("AMIDALA_REQUIRE_SIGNING", "1").strip() not in {
-    "0", "false", "False", "no", "NO"
+REQUIRED_SAFETY_MARKERS = {
+    "test_screen.py": (
+        "validate_pass_evidence",
+        "_cycle_in_range_samples",
+        "_result_pending",
+        "fresh_cycle",
+        "_cycle_terminal_seen",
+    ),
+    "hipot_device.py": (
+        "_cycle_active_confirmed",
+        "SAFEty:RESult:LAST:JUDG?",
+        "presence_min_current",
+        "SYST:KLOC ON",
+        "_verify_acw_readback",
+    ),
+    "safety_rules.py": (
+        "MIN_PRESENCE_CURRENT_MA = 0.500",
+        "validate_pass_evidence",
+        "validate_timeout_for_profile",
+    ),
+    "runtime_logging.py": (
+        "configure_runtime_logging",
+        "app_runtime_logs",
+    ),
 }
 
 
 class BuildError(RuntimeError):
-    """Kontrolowany błąd procesu budowania."""
+    pass
 
 
 def print_header(title: str) -> None:
-    print("\n" + "=" * 68)
+    print("\n" + "=" * 64)
     print(f"  {title}")
-    print("=" * 68)
+    print("=" * 64)
 
 
-def run_command(
-    command: list[str],
-    *,
-    cwd: Optional[Path] = None,
-    hide_sensitive: bool = False,
-) -> None:
-    if hide_sensitive:
-        print("[*] Uruchamiam polecenie podpisujące (dane certyfikatu ukryte).")
-    else:
-        print("[*] " + subprocess.list2cmdline(command))
-
+def run_command(command: list[str], cwd: Optional[Path] = None) -> None:
+    print("[*] " + subprocess.list2cmdline(command))
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
@@ -139,105 +133,145 @@ def run_command(
     )
     if result.returncode != 0:
         raise BuildError(
-            f"Polecenie zakończyło się błędem {result.returncode}: "
-            f"{command[0]}"
+            f"Polecenie zakonczylo sie bledem {result.returncode}: {command[0]}"
         )
 
 
-def ensure_package(import_name: str, pip_name: str) -> None:
-    if importlib.util.find_spec(import_name) is not None:
-        return
+def ensure_package(
+    import_name: str,
+    pip_name: str,
+    expected_version: str,
+) -> None:
+    if importlib.util.find_spec(import_name) is None:
+        raise BuildError(
+            f"Brak pakietu {pip_name}=={expected_version}. Zainstaluj go w .venv: "
+            f"{sys.executable} -m pip install {pip_name}=={expected_version}"
+        )
+    try:
+        actual_version = importlib.metadata.version(pip_name)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise BuildError(f"Nie mozna odczytac wersji pakietu {pip_name}") from exc
+    if actual_version != expected_version:
+        raise BuildError(
+            f"Wymagany {pip_name}=={expected_version}, znaleziono {actual_version}. "
+            "Uzyj zatwierdzonego srodowiska .venv."
+        )
+    print(f"[+] {pip_name} {actual_version}: OK")
 
-    print(f"[~] Brak pakietu {pip_name}. Instaluję...")
-    run_command([sys.executable, "-m", "pip", "install", pip_name])
 
-
-def numeric_suffix(path: Path, canonical_name: str) -> int:
-    """Zwraca numer z nazwy typu gui(3).py; plik kanoniczny ma priorytet."""
-    if path.name.lower() == canonical_name.lower():
-        return 10**9
-
-    canonical = Path(canonical_name)
-    pattern = re.compile(
-        rf"^{re.escape(canonical.stem)}\((\d+)\){re.escape(canonical.suffix)}$",
-        re.IGNORECASE,
+def verify_build_environment() -> None:
+    if sys.version_info[:2] != REQUIRED_PYTHON:
+        raise BuildError(
+            f"Wymagany Python {REQUIRED_PYTHON[0]}.{REQUIRED_PYTHON[1]}.x, "
+            f"uruchomiono {sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
+    print(
+        f"[+] Python {sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}: OK"
     )
-    match = pattern.match(path.name)
-    return int(match.group(1)) if match else -1
+    for import_name, (pip_name, version) in REQUIRED_PACKAGES.items():
+        ensure_package(import_name, pip_name, version)
 
 
-def resolve_project_file(canonical_name: str, required: bool = True) -> Optional[Path]:
-    """
-    Najpierw szuka nazwy kanonicznej, a następnie plików pobranych przez
-    przeglądarkę/ChatGPT z dopiskiem (1), (2), itd.
+FORBIDDEN_DUPLICATE_MARKERS = (
+    "_check_serial_duplicate",
+    "_check_duplicate_async",
+    "_duplicate_check_done",
+    "_duplicate_allowed",
+    "Duplikat SN",
+    "Sprawdzanie numeru seryjnego",
+    "był już testowany",
+    "byl juz testowany",
+)
+
+
+def resolve_project_file(
+    canonical_name: str,
+    required: bool = True,
+) -> Optional[Path]:
+    """Używa wyłącznie pliku o dokładnej, kanonicznej nazwie.
+
+    Celowo nie wybiera plików typu ``test_screen(3).py``. Dzięki temu builder
+    nie może niejawnie zbudować EXE ze starej lub przypadkowej kopii kodu.
     """
     exact = ROOT_DIR / canonical_name
     if exact.is_file():
         return exact
 
-    canonical = Path(canonical_name)
-    pattern = re.compile(
-        rf"^{re.escape(canonical.stem)}(?:\((\d+)\))?{re.escape(canonical.suffix)}$",
-        re.IGNORECASE,
-    )
-    candidates = [
-        path for path in ROOT_DIR.iterdir()
-        if path.is_file() and pattern.match(path.name)
-    ]
-
-    if candidates:
-        selected = max(
-            candidates,
-            key=lambda p: (numeric_suffix(p, canonical_name), p.stat().st_mtime),
-        )
-        print(f"[~] {canonical_name}: używam pliku {selected.name}")
-        return selected
-
     if required:
-        raise BuildError(f"Brak wymaganego pliku: {canonical_name}")
+        raise BuildError(
+            f"Brak wymaganego pliku: {canonical_name}. "
+            "Nadaj aktualnemu plikowi dokładnie tę nazwę."
+        )
     return None
 
 
-def prepare_staging() -> dict[str, Path]:
-    print_header("Przygotowanie plików Hi-Pot Amidala")
+def validate_source_file(canonical_name: str, source: Path) -> None:
+    """Sprawdza wymagane zabezpieczenia i brak wycofanej logiki."""
+    text = source.read_text(encoding="utf-8", errors="strict")
 
-    if STAGING_DIR.exists():
-        shutil.rmtree(STAGING_DIR)
-    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    if canonical_name == "test_screen.py":
+        found = [marker for marker in FORBIDDEN_DUPLICATE_MARKERS if marker in text]
+        if found:
+            raise BuildError(
+                "test_screen.py nadal zawiera logike kontroli duplikatow: "
+                + ", ".join(found)
+            )
 
-    resolved: dict[str, Path] = {}
+    missing = [
+        marker
+        for marker in REQUIRED_SAFETY_MARKERS.get(canonical_name, ())
+        if marker not in text
+    ]
+    if missing:
+        raise BuildError(
+            f"{canonical_name}: brakuje wymaganych elementow zabezpieczen: "
+            + ", ".join(missing)
+        )
 
-    for canonical_name in PROJECT_FILES:
-        source = resolve_project_file(canonical_name, required=True)
-        assert source is not None
-        destination = STAGING_DIR / canonical_name
-        shutil.copy2(source, destination)
-        resolved[canonical_name] = source
-        print(f"[+] {source.name} -> staging/{canonical_name}")
 
-    for canonical_name in EDITABLE_DATA_FILES:
-        source = resolve_project_file(canonical_name, required=True)
-        assert source is not None
-        resolved[canonical_name] = source
-        print(f"[+] Dane edytowalne: {source.name}")
+def run_release_preflight() -> None:
+    """Kompiluje kod, uruchamia regresje i waliduje konfiguracje wydania."""
+    print_header("Kontrola przed wydaniem")
 
-    for canonical_name in OPTIONAL_DATA_FILES:
-        source = resolve_project_file(canonical_name, required=False)
-        if source:
-            resolved[canonical_name] = source
-            print(f"[+] Dane opcjonalne: {source.name}")
-        else:
-            print(f"[~] Brak {canonical_name} - pomijam")
+    source_files = [ROOT_DIR / name for name in PROJECT_FILES]
+    source_files.extend([ROOT_DIR / "release_selftest.py", ROOT_DIR / "create_exe.py"])
+    missing = [str(path) for path in source_files if not path.is_file()]
+    if missing:
+        raise BuildError("Brak plikow kontroli wydania: " + ", ".join(missing))
 
-    create_version_file(STAGING_DIR / "version_info.txt")
-    create_runtime_hook(STAGING_DIR / "runtime_hook_amidala.py")
-    return resolved
+    run_command(
+        [sys.executable, "-m", "py_compile", *map(str, source_files)],
+        cwd=ROOT_DIR,
+    )
+    print("[+] Kompilacja wszystkich skryptow: OK")
 
+    run_command(
+        [sys.executable, str(ROOT_DIR / "release_selftest.py")],
+        cwd=ROOT_DIR,
+    )
+
+    validation_code = (
+        "from config import Config\n"
+        "from hwid_map import HwidMap\n"
+        "cfg = Config()\n"
+        "assert cfg.INTERLOCK_ENABLED, "
+        "'INTERLOCK_ENABLED musi byc true w buildzie produkcyjnym'\n"
+        "assert cfg.AUTO_SAVE_RESULTS, "
+        "'AUTO_SAVE_RESULTS musi byc true w buildzie produkcyjnym'\n"
+        "assert float(cfg.TEST_PROFILE['presence_min_current']) >= 0.500, "
+        "'presence_min_current nie moze byc nizszy niz 0.500 mA'\n"
+        "assert len(HwidMap().get_all()) > 0, 'Mapa HWID jest pusta'\n"
+        "print('[PREFLIGHT] Konfiguracja i mapa HWID: OK')\n"
+    )
+    run_command([sys.executable, "-c", validation_code], cwd=ROOT_DIR)
+    print(f"[+] Wersja zrodla: {SOURCE_APP_VERSION}; wersja EXE: {VERSION}")
 
 def create_version_file(path: Path) -> None:
     version_tuple = tuple(int(part) for part in VERSION.split("."))
     if len(version_tuple) != 4:
-        raise BuildError("VERSION musi mieć format czterech liczb, np. 1.0.0.0")
+        raise BuildError("VERSION musi miec format np. 1.0.0.0")
 
     content = f"""VSVersionInfo(
   ffi=FixedFileInfo(
@@ -268,35 +302,135 @@ def create_version_file(path: Path) -> None:
 )
 """
     path.write_text(content, encoding="utf-8")
-    print(f"[+] Utworzono {path.name}")
 
 
 def create_runtime_hook(path: Path) -> None:
-    # Dzięki temu amidala_config.json i hwid_map.json są zawsze czytane
-    # z folderu obok EXE, niezależnie od skrótu i pola 'Rozpocznij w'.
+    """Ustawia folder EXE i jawne sciezki bibliotek Tcl/Tk."""
     content = """import os
 import sys
 
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     app_dir = os.path.dirname(os.path.abspath(sys.executable))
+    internal_dir = getattr(sys, "_MEIPASS", os.path.join(app_dir, "_internal"))
+
+    tcl_dir = os.path.join(internal_dir, "_tcl_data")
+    tk_dir = os.path.join(internal_dir, "_tk_data")
+
+    if os.path.isdir(tcl_dir):
+        os.environ["TCL_LIBRARY"] = tcl_dir
+    if os.path.isdir(tk_dir):
+        os.environ["TK_LIBRARY"] = tk_dir
+
     os.chdir(app_dir)
 """
     path.write_text(content, encoding="utf-8")
-    print(f"[+] Utworzono {path.name}")
 
 
-def build_application() -> None:
-    print_header("Budowanie folderu aplikacji")
+def locate_tcl_tk() -> tuple[Path, Path]:
+    """Znajduje pelne katalogi Tcl i Tk uzywane przez biezacego Pythona."""
+    try:
+        import tkinter as tk
 
-    ensure_package("PyInstaller", "pyinstaller")
-    ensure_package("serial", "pyserial")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            tcl_dir = Path(root.tk.eval("info library")).resolve()
+            tk_dir = Path(root.tk.eval("set tk_library")).resolve()
+        finally:
+            root.destroy()
+    except Exception as exc:
+        raise BuildError(f"Nie moge ustalic katalogow Tcl/Tk: {exc}") from exc
+
+    required = [
+        tcl_dir / "init.tcl",
+        tk_dir / "tk.tcl",
+        tk_dir / "ttk" / "scrollbar.tcl",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise BuildError(
+            "Instalacja Tcl/Tk jest niekompletna. Brakuje: " + ", ".join(missing)
+        )
+
+    print(f"[+] Tcl: {tcl_dir}")
+    print(f"[+] Tk : {tk_dir}")
+    return tcl_dir, tk_dir
+
+
+def copy_tcl_tk_runtime(tcl_dir: Path, tk_dir: Path) -> None:
+    """Dopelnia katalog _internal o wszystkie skrypty Tcl/Tk i Ttk."""
+    print_header("Weryfikacja bibliotek Tcl/Tk")
+
+    internal_dir = OUTPUT_DIR / "_internal"
+    tcl_target = internal_dir / "_tcl_data"
+    tk_target = internal_dir / "_tk_data"
+
+    internal_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(tcl_dir, tcl_target, dirs_exist_ok=True)
+    shutil.copytree(tk_dir, tk_target, dirs_exist_ok=True)
+
+    required = [
+        tcl_target / "init.tcl",
+        tk_target / "tk.tcl",
+        tk_target / "ttk" / "scrollbar.tcl",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise BuildError(
+            "Po buildzie nadal brakuje plikow Tcl/Tk: " + ", ".join(missing)
+        )
+
+    print(f"[+] Tcl skopiowany do: {tcl_target}")
+    print(f"[+] Tk/Ttk skopiowany do: {tk_target}")
+    print("[+] Zweryfikowano: _tk_data\\ttk\\scrollbar.tcl")
+
+
+def prepare_staging() -> dict[str, Path]:
+    print_header("Przygotowanie plikow")
+
+    if STAGING_DIR.exists():
+        shutil.rmtree(STAGING_DIR)
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+    resolved: dict[str, Path] = {}
+
+    for canonical_name in PROJECT_FILES:
+        source = resolve_project_file(canonical_name)
+        assert source is not None
+        validate_source_file(canonical_name, source)
+        shutil.copy2(source, STAGING_DIR / canonical_name)
+        resolved[canonical_name] = source
+        digest = hashlib.sha256(source.read_bytes()).hexdigest().upper()[:16]
+        print(f"[+] {source.name} -> {canonical_name}  SHA256:{digest}")
+
+    for canonical_name in EDITABLE_DATA_FILES:
+        source = resolve_project_file(canonical_name)
+        assert source is not None
+        resolved[canonical_name] = source
+        print(f"[+] Dane edytowalne: {source.name}")
+
+    for canonical_name in OPTIONAL_DATA_FILES:
+        source = resolve_project_file(canonical_name, required=False)
+        if source:
+            resolved[canonical_name] = source
+            print(f"[+] Dane opcjonalne: {source.name}")
+        else:
+            print(f"[~] Brak {canonical_name} - pomijam")
+
+    create_version_file(STAGING_DIR / "version_info.txt")
+    create_runtime_hook(STAGING_DIR / "runtime_hook_amidala.py")
+    return resolved
+
+
+def build_application(tcl_dir: Path, tk_dir: Path) -> None:
+    print_header("Budowanie Hi-Pot Amidala")
 
     if OUTPUT_DIR.exists():
         shutil.rmtree(OUTPUT_DIR)
 
-    pyinstaller_work = BUILD_DIR / "pyinstaller"
+    work_dir = BUILD_DIR / "pyinstaller"
     spec_dir = BUILD_DIR / "spec"
-    pyinstaller_work.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
     spec_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
@@ -313,13 +447,17 @@ def build_application() -> None:
         "--distpath",
         str(DIST_DIR),
         "--workpath",
-        str(pyinstaller_work),
+        str(work_dir),
         "--specpath",
         str(spec_dir),
         "--version-file",
         str(STAGING_DIR / "version_info.txt"),
         "--runtime-hook",
         str(STAGING_DIR / "runtime_hook_amidala.py"),
+        "--add-data",
+        f"{tcl_dir};_tcl_data",
+        "--add-data",
+        f"{tk_dir};_tk_data",
     ]
 
     icon = resolve_project_file("amidala.ico", required=False)
@@ -327,165 +465,29 @@ def build_application() -> None:
         command.extend(["--icon", str(icon)])
         print(f"[+] Ikona: {icon.name}")
     else:
-        print("[~] Brak amidala.ico - używam domyślnej ikony")
+        print("[~] Brak amidala.ico - uzywam domyslnej ikony")
 
     for module_name in HIDDEN_IMPORTS:
         command.extend(["--hidden-import", module_name])
 
-    command.append(ENTRY_POINT)
-
+    command.append("main.py")
     run_command(command, cwd=STAGING_DIR)
 
     if not EXE_PATH.is_file():
-        raise BuildError(f"PyInstaller nie utworzył oczekiwanego pliku: {EXE_PATH}")
-
-    print(f"[+] Utworzono: {EXE_PATH}")
+        raise BuildError(f"Nie znaleziono utworzonego EXE: {EXE_PATH}")
 
 
-def copy_editable_files(resolved_files: dict[str, Path]) -> None:
-    print_header("Kopiowanie konfiguracji obok EXE")
-
+def copy_editable_files(resolved: dict[str, Path]) -> None:
+    print_header("Kopiowanie konfiguracji")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     for canonical_name in EDITABLE_DATA_FILES + OPTIONAL_DATA_FILES:
-        source = resolved_files.get(canonical_name)
+        source = resolved.get(canonical_name)
         if not source:
             continue
         destination = OUTPUT_DIR / canonical_name
         shutil.copy2(source, destination)
-        print(f"[+] {source.name} -> {destination.name}")
-
-
-def version_key(path: Path) -> tuple[int, ...]:
-    numbers = re.findall(r"\d+", str(path.parent))
-    return tuple(int(number) for number in numbers[-4:]) if numbers else (0,)
-
-
-def find_signtool() -> Optional[Path]:
-    from_path = shutil.which("signtool.exe") or shutil.which("signtool")
-    if from_path:
-        return Path(from_path)
-
-    search_roots = []
-    for env_name in ("ProgramFiles(x86)", "ProgramFiles"):
-        base = os.environ.get(env_name)
-        if base:
-            search_roots.append(Path(base))
-
-    candidates: list[Path] = []
-    for base in search_roots:
-        candidates.extend((base / "Windows Kits" / "10" / "bin").glob("*/x64/signtool.exe"))
-        candidates.extend((base / "Windows Kits" / "10" / "bin").glob("x64/signtool.exe"))
-        candidates.extend((base / "Windows Kits" / "8.1" / "bin" / "x64").glob("signtool.exe"))
-
-    candidates = [candidate for candidate in candidates if candidate.is_file()]
-    return max(candidates, key=version_key) if candidates else None
-
-
-def signing_arguments() -> Optional[list[str]]:
-    """Zwraca argumenty wyboru certyfikatu bez polecenia SignTool."""
-    thumbprint = os.environ.get("AMIDALA_SIGN_CERT_SHA1", "").replace(" ", "").strip()
-    subject = os.environ.get("AMIDALA_SIGN_CERT_SUBJECT", "").strip()
-    pfx_value = os.environ.get("AMIDALA_SIGN_PFX", "").strip()
-    machine_store = os.environ.get("AMIDALA_SIGN_MACHINE_STORE", "0").strip() in {
-        "1", "true", "True", "yes", "YES"
-    }
-
-    if thumbprint:
-        args = ["/sha1", thumbprint, "/s", "My"]
-        if machine_store:
-            args.append("/sm")
-        print("[+] Podpis: certyfikat z magazynu Windows wybrany odciskiem SHA-1")
-        return args
-
-    if subject:
-        args = ["/n", subject, "/s", "My"]
-        if machine_store:
-            args.append("/sm")
-        print(f"[+] Podpis: certyfikat z magazynu Windows, Subject zawiera: {subject}")
-        return args
-
-    pfx_path: Optional[Path] = None
-    if pfx_value:
-        pfx_path = Path(pfx_value).expanduser()
-        if not pfx_path.is_absolute():
-            pfx_path = ROOT_DIR / pfx_path
-    else:
-        default_pfx = ROOT_DIR / "code_signing.pfx"
-        if default_pfx.is_file():
-            pfx_path = default_pfx
-
-    if pfx_path:
-        if not pfx_path.is_file():
-            raise BuildError(f"Nie znaleziono certyfikatu PFX: {pfx_path}")
-
-        password = os.environ.get("AMIDALA_SIGN_PFX_PASSWORD")
-        if password is None and sys.stdin.isatty():
-            password = getpass.getpass("Hasło do certyfikatu PFX: ")
-
-        args = ["/f", str(pfx_path)]
-        if password:
-            args.extend(["/p", password])
-        print(f"[+] Podpis: certyfikat PFX {pfx_path.name}")
-        return args
-
-    return None
-
-
-def sign_and_verify_executable() -> bool:
-    print_header("Podpis cyfrowy Authenticode")
-
-    signtool = find_signtool()
-    cert_args = signing_arguments()
-
-    if not signtool:
-        message = (
-            "Nie znaleziono signtool.exe. Zainstaluj Windows SDK "
-            "(Signing Tools for Desktop Apps)."
-        )
-        if REQUIRE_SIGNING:
-            raise BuildError(message)
-        print(f"[!] {message} Build pozostaje NIEPODPISANY.")
-        return False
-
-    print(f"[+] SignTool: {signtool}")
-
-    if not cert_args:
-        message = (
-            "Nie skonfigurowano certyfikatu. Ustaw AMIDALA_SIGN_CERT_SHA1, "
-            "AMIDALA_SIGN_CERT_SUBJECT albo AMIDALA_SIGN_PFX."
-        )
-        if REQUIRE_SIGNING:
-            raise BuildError(message)
-        print(f"[!] {message} Build pozostaje NIEPODPISANY.")
-        return False
-
-    command = [
-        str(signtool),
-        "sign",
-        "/v",
-        "/fd",
-        "SHA256",
-        "/d",
-        APP_DESCRIPTION,
-    ]
-    command.extend(cert_args)
-
-    if TIMESTAMP_URL:
-        command.extend(["/tr", TIMESTAMP_URL, "/td", "SHA256"])
-
-    command.append(str(EXE_PATH))
-    run_command(command, hide_sensitive=True)
-
-    verify_command = [
-        str(signtool),
-        "verify",
-        "/pa",
-        "/v",
-        str(EXE_PATH),
-    ]
-    run_command(verify_command)
-    print("[+] Podpis został zweryfikowany poprawnie.")
-    return True
+        print(f"[+] {canonical_name} obok EXE")
 
 
 def sha256_file(path: Path) -> str:
@@ -502,72 +504,76 @@ def iter_output_files() -> Iterable[Path]:
             yield path
 
 
-def write_manifest(signed: bool) -> Path:
-    manifest_path = OUTPUT_DIR / "build_manifest.txt"
+def write_manifest() -> None:
+    manifest = OUTPUT_DIR / "build_manifest.txt"
     lines = [
         f"Application: {APP_NAME}",
         f"Version: {VERSION}",
         f"Company: {COMPANY_NAME}",
         f"Build time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
-        f"Authenticode signed: {'YES' if signed else 'NO'}",
-        f"Timestamp server: {TIMESTAMP_URL if signed and TIMESTAMP_URL else 'N/A'}",
+        "Authenticode signed: NO",
         "",
         "SHA-256:",
     ]
 
     for path in iter_output_files():
-        relative = path.relative_to(OUTPUT_DIR)
-        lines.append(f"{sha256_file(path)}  {relative}")
+        lines.append(f"{sha256_file(path)}  {path.relative_to(OUTPUT_DIR)}")
 
-    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"[+] Manifest: {manifest_path}")
-    return manifest_path
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def show_summary(signed: bool) -> None:
-    exe_size_mb = EXE_PATH.stat().st_size / (1024 * 1024)
-    folder_size = sum(path.stat().st_size for path in OUTPUT_DIR.rglob("*") if path.is_file())
-    folder_size_mb = folder_size / (1024 * 1024)
+def show_summary() -> None:
+    exe_size = EXE_PATH.stat().st_size / (1024 * 1024)
+    folder_size = sum(
+        path.stat().st_size for path in OUTPUT_DIR.rglob("*") if path.is_file()
+    ) / (1024 * 1024)
 
-    print_header("BUILD ZAKOŃCZONY")
+    print_header("BUILD ZAKONCZONY")
     print(f"Folder aplikacji : {OUTPUT_DIR}")
-    print(f"Plik uruchamiany : {EXE_PATH}")
-    print(f"Rozmiar EXE      : {exe_size_mb:.1f} MB")
-    print(f"Rozmiar folderu  : {folder_size_mb:.1f} MB")
-    print(f"Podpis cyfrowy   : {'TAK' if signed else 'NIE'}")
-    print("\n[!] Na stanowiska kopiuj CAŁY folder 'Hi-Pot Amidala'.")
-    print("[!] Nie modyfikuj EXE po podpisaniu - zmiana unieważni podpis.")
+    print(f"Uruchamiaj       : {EXE_PATH}")
+    print(f"Rozmiar EXE      : {exe_size:.1f} MB")
+    print(f"Rozmiar folderu  : {folder_size:.1f} MB")
+    print("Podpis cyfrowy   : NIE")
+    print("\n[!] Kopiuj caly folder 'Hi-Pot Amidala', nie samo EXE.")
+    print("[!] amidala_config.json i hwid_map.json musza pozostac obok EXE.")
 
 
 def main() -> int:
     try:
         if os.name != "nt":
-            raise BuildError("Ten builder jest przeznaczony do uruchamiania na Windows.")
+            raise BuildError("Builder nalezy uruchomic na Windows.")
 
-        resolved_files = prepare_staging()
-        build_application()
-        copy_editable_files(resolved_files)
-        signed = sign_and_verify_executable()
-        write_manifest(signed)
-        show_summary(signed)
+        verify_build_environment()
+        run_command(
+            [sys.executable, "-c", "import serial; print('[PREFLIGHT] pyserial: OK')"],
+            cwd=ROOT_DIR,
+        )
+        run_release_preflight()
+        resolved = prepare_staging()
+        tcl_dir, tk_dir = locate_tcl_tk()
+        build_application(tcl_dir, tk_dir)
+        copy_tcl_tk_runtime(tcl_dir, tk_dir)
+        copy_editable_files(resolved)
+        write_manifest()
+        show_summary()
         return 0
 
     except KeyboardInterrupt:
-        print("\n[!] Anulowano przez użytkownika.")
+        print("\n[!] Anulowano przez uzytkownika.")
         return 130
     except BuildError as error:
-        print_header("BŁĄD BUDOWANIA")
+        print_header("BLAD BUDOWANIA")
         print(f"[!] {error}")
-        print(f"[~] Logi PyInstaller: {BUILD_DIR / 'pyinstaller'}")
+        print(f"[~] Ostrzezenia PyInstaller: {BUILD_DIR / 'pyinstaller'}")
         return 1
     except Exception as error:
-        print_header("NIEOCZEKIWANY BŁĄD")
+        print_header("NIEOCZEKIWANY BLAD")
         print(f"[!] {type(error).__name__}: {error}")
         return 1
     finally:
         if sys.stdin.isatty():
             try:
-                input("\nNaciśnij Enter, aby zamknąć...")
+                input("\nNacisnij Enter, aby zamknac...")
             except (EOFError, KeyboardInterrupt):
                 pass
 
